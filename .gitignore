@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# 环境与密钥
+.env
+.env.*
+!.env.example
+
+# IDE / 系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+
+# pi 本地数据
+.pi/
