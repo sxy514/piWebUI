@@ -19,6 +19,15 @@ const marked = new Marked(
 marked.use({
   gfm: true,
   breaks: true,
+  renderer: {
+    code({ text, lang }) {
+      const cleanLang = (lang || '').trim().toLowerCase()
+      if (cleanLang === 'mermaid') {
+        return `<div class="mermaid">${text}</div>\n`
+      }
+      return false
+    },
+  },
 })
 
 marked.use(markedKatex({ throwOnError: false }))
@@ -27,9 +36,9 @@ marked.use(markedKatex({ throwOnError: false }))
 export function renderMarkdown(text: string): string {
   const raw = marked.parse(text, { async: false }) as string
 
-  // ```mermaid 代码块 → 交给 mermaid.run() 处理的容器
+  // 兼容兜底：如果还有 pre/code 形式的 mermaid，转成 .mermaid 容器
   const withMermaid = raw.replace(
-    /<pre><code class="[^"]*language-mermaid">([\s\S]*?)<\/code><\/pre>/g,
+    /<pre><code class="[^"]*language-mermaid[^"]*">([\s\S]*?)<\/code><\/pre>/gi,
     '<div class="mermaid">$1</div>',
   )
 

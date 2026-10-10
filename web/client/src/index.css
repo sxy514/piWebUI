@@ -273,6 +273,7 @@ body {
 }
 
 .markdown pre {
+  position: relative;
   margin: 0.6em 0;
   padding: 0;
   overflow-x: auto;
@@ -284,6 +285,7 @@ body {
 .markdown pre code.hljs {
   display: block;
   padding: 0.8rem 1rem;
+  padding-right: 4.8rem;
   font-size: 0.82em;
   line-height: 1.6;
 }
@@ -308,8 +310,9 @@ body {
 
 /* ---- mermaid ---- */
 .mermaid {
+  position: relative;
   margin: 0.6em 0;
-  padding: 1rem;
+  padding: 1.25rem 1rem 1rem 1rem;
   border: 1px solid oklch(1 0 0 / 0.12);
   border-radius: 0.75rem;
   background: oklch(1 0 0 / 0.05);
@@ -330,6 +333,45 @@ body {
 .mermaid.mermaid-error {
   color: oklch(0.7 0.16 25);
   text-align: left;
+}
+
+.code-copy-btn,
+.mermaid-copy-btn {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.55rem;
+  border-radius: 0.5rem;
+  border: 1px solid oklch(1 0 0 / 0.15);
+  background: oklch(0.18 0.02 270 / 0.85);
+  color: oklch(0.82 0.02 270);
+  backdrop-filter: blur(8px);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.85;
+  transition: all 0.18s ease;
+  z-index: 5;
+}
+
+.code-copy-btn:hover,
+.mermaid-copy-btn:hover {
+  opacity: 1;
+  background: oklch(0.28 0.04 275 / 0.95);
+  color: oklch(0.98 0.01 270);
+  border-color: oklch(1 0 0 / 0.25);
+}
+
+.code-copy-btn.copied,
+.mermaid-copy-btn.copied {
+  opacity: 1;
+  color: oklch(0.75 0.18 150);
+  border-color: oklch(0.75 0.18 150 / 0.5);
+  background: oklch(0.25 0.04 150 / 0.3);
 }
 
 /* 打字光标 */
