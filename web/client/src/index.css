@@ -449,7 +449,7 @@ body {
 .markdown pre code.hljs {
   display: block;
   padding: 0.8rem 1rem;
-  padding-right: 4.8rem;
+  padding-right: 2.5rem;
   font-size: 0.82em;
   line-height: 1.6;
 }
@@ -503,22 +503,21 @@ body {
 .code-copy-btn,
 .mermaid-copy-btn {
   position: absolute;
-  top: 0.5rem;
-  right: 0.5rem;
+  top: 0.45rem;
+  right: 0.45rem;
   display: inline-flex;
   align-items: center;
-  gap: 0.35rem;
-  padding: 0.25rem 0.55rem;
-  border-radius: 0.5rem;
-  border: 1px solid oklch(1 0 0 / 0.15);
-  background: oklch(0.18 0.02 270 / 0.85);
-  color: oklch(0.82 0.02 270);
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border-radius: 0.45rem;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted-foreground);
   backdrop-filter: blur(8px);
-  font-family: inherit;
-  font-size: 11px;
-  line-height: 1;
   cursor: pointer;
-  opacity: 0.85;
+  opacity: 0.7;
   transition: all 0.18s ease;
   z-index: 5;
 }
@@ -526,9 +525,9 @@ body {
 .code-copy-btn:hover,
 .mermaid-copy-btn:hover {
   opacity: 1;
-  background: oklch(0.28 0.04 275 / 0.95);
-  color: oklch(0.98 0.01 270);
-  border-color: oklch(1 0 0 / 0.25);
+  background: var(--muted);
+  color: var(--foreground);
+  border-color: var(--border);
 }
 
 .code-copy-btn.copied,
@@ -536,7 +535,7 @@ body {
   opacity: 1;
   color: oklch(0.75 0.18 150);
   border-color: oklch(0.75 0.18 150 / 0.5);
-  background: oklch(0.25 0.04 150 / 0.3);
+  background: oklch(0.75 0.18 150 / 0.15);
 }
 
 /* 打字光标 */
