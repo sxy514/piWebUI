@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import uuid
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -18,11 +19,30 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from pi_agent import AsyncPiClient, Event, PiBusyError, PiError, PiRunError
+from pi_agent import AsyncPiClient, Event, Limits, PiBusyError, PiError, PiRunError
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 RUN_TIMEOUT = 300.0
 TOOL_RESULT_MAX = 400
+
+import shutil
+
+NODE_DIR = Path(r"D:\ProgramFile\NodeJs")
+
+def get_pi_executable() -> list[str] | str:
+    if shutil.which("pi"):
+        return "pi"
+    node_exe = NODE_DIR / "node.exe"
+    cli_js = NODE_DIR / "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+    if node_exe.is_file() and cli_js.is_file():
+        return [str(node_exe), str(cli_js)]
+    pi_cmd = NODE_DIR / "pi.cmd"
+    if pi_cmd.is_file():
+        return str(pi_cmd)
+    return "pi"
+
+PI_EXECUTABLE = get_pi_executable()
+PI_LIMITS = Limits(startup_timeout=120.0, command_timeout=60.0)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("piweb")
@@ -87,7 +107,13 @@ def auto_approve(request: dict) -> object:
 async def get_client(client_id: str) -> AsyncPiClient:
     client = _clients.get(client_id)
     if client is None:
-        client = AsyncPiClient(cwd=str(PROJECT_DIR), ui_handler=auto_approve)
+        client = AsyncPiClient(
+            executable=PI_EXECUTABLE,
+            cwd=str(PROJECT_DIR),
+            ui_handler=auto_approve,
+            limits=PI_LIMITS,
+            extra_args=["--offline"],
+        )
         await client.start()
         _clients[client_id] = client
         _client_locks[client_id] = asyncio.Lock()
