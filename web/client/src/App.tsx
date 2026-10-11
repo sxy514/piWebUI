@@ -4,9 +4,11 @@ import { EmptyState } from '@/components/EmptyState'
 import { MessageItem } from '@/components/MessageItem'
 import { ModelMenu } from '@/components/ModelMenu'
 import { Sidebar } from '@/components/Sidebar'
+import { ThemeMenu } from '@/components/ThemeMenu'
 import { Spinner } from '@/components/ui/spinner'
 import {
   createSession,
+  deleteSession,
   getHistory,
   getModels,
   interrupt,
@@ -279,6 +281,9 @@ export default function App() {
     async (file: string) => {
       if (!session || streaming) return
       setSidebarOpen(false)
+      const isCurrent = history.find((h) => h.file === file)?.current
+      if (isCurrent) return
+
       try {
         setSwitching(true)
         const res = await switchSession(session.client_id, file)
@@ -290,7 +295,25 @@ export default function App() {
         setSwitching(false)
       }
     },
-    [session, streaming, refreshHistory],
+    [session, streaming, history, refreshHistory],
+  )
+
+  const handleDeleteHistory = useCallback(
+    async (file: string) => {
+      if (!session || streaming || switching) return
+      if (!window.confirm('确定要删除该历史会话吗？此操作无法撤销。')) return
+      try {
+        const res = await deleteSession(session.client_id, file)
+        if (res.was_current) {
+          setMessages([])
+          setInput('')
+        }
+        await refreshHistory(session.client_id)
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err))
+      }
+    },
+    [session, streaming, switching, refreshHistory],
   )
 
   const handleModelSelect = useCallback(
@@ -345,9 +368,9 @@ export default function App() {
   return (
     <div className="relative h-full overflow-hidden">
       {/* 背景光斑 */}
-      <div className="orb -top-32 -left-24 size-96" style={{ background: 'oklch(0.6 0.2 300)', opacity: 0.35 }} />
-      <div className="orb top-1/3 -right-32 size-[28rem]" style={{ background: 'oklch(0.6 0.18 230)', opacity: 0.3, animationDelay: '-6s' }} />
-      <div className="orb -bottom-40 left-1/3 size-80" style={{ background: 'oklch(0.65 0.16 340)', opacity: 0.3, animationDelay: '-12s' }} />
+      <div className="orb -top-32 -left-24 size-96" style={{ background: 'var(--orb-1)', opacity: 'var(--orb-opacity)' }} />
+      <div className="orb top-1/3 -right-32 size-[28rem]" style={{ background: 'var(--orb-2)', opacity: 'var(--orb-opacity)', animationDelay: '-6s' }} />
+      <div className="orb -bottom-40 left-1/3 size-80" style={{ background: 'var(--orb-3)', opacity: 'var(--orb-opacity)', animationDelay: '-12s' }} />
 
       <div className="relative z-10 flex h-full">
         <Sidebar
@@ -358,6 +381,7 @@ export default function App() {
           busy={streaming || switching}
           onNewChat={() => void handleNewChat()}
           onSelect={(file) => void handleSelectHistory(file)}
+          onDelete={(file) => void handleDeleteHistory(file)}
         />
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -389,6 +413,7 @@ export default function App() {
                 />
                 {streaming ? '生成中' : '就绪'}
               </span>
+              <ThemeMenu />
               <button
                 type="button"
                 onClick={() => void handleNewChat()}

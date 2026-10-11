@@ -121,6 +121,13 @@ export function switchSession(
   return postJson('/api/switch', { client_id: clientId, session_file: file })
 }
 
+export function deleteSession(
+  clientId: string,
+  file: string,
+): Promise<{ ok: boolean; was_current: boolean }> {
+  return postJson('/api/history/delete', { client_id: clientId, session_file: file })
+}
+
 export function getModels(): Promise<ModelItem[]> {
   return fetch('/api/models').then((r) => r.json())
 }

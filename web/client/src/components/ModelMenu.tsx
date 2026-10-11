@@ -41,7 +41,7 @@ export function ModelMenu({ models, current, onSelect }: ModelMenuProps) {
       </button>
 
       {open && (
-        <div className="absolute top-full left-0 z-40 mt-2 max-h-80 w-72 overflow-y-auto rounded-2xl border border-white/10 bg-neutral-900/95 p-1.5 shadow-2xl backdrop-blur-xl">
+        <div className="absolute top-full left-0 z-40 mt-2 max-h-80 w-72 overflow-y-auto rounded-2xl border border-border bg-[var(--popover)] p-1.5 shadow-2xl backdrop-blur-xl">
           {models.length === 0 && (
             <p className="px-3 py-2 text-xs text-muted-foreground">加载中…</p>
           )}

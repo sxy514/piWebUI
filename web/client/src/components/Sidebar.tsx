@@ -1,4 +1,4 @@
-import { Bot, Plus } from 'lucide-react'
+import { Bot, Plus, Trash2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Spinner } from '@/components/ui/spinner'
 import type { HistoryItem } from '@/lib/api'
@@ -12,6 +12,7 @@ interface SidebarProps {
   busy: boolean
   onNewChat: () => void
   onSelect: (file: string) => void
+  onDelete: (file: string) => void
 }
 
 function formatTime(mtime: number): string {
@@ -34,6 +35,7 @@ export function Sidebar({
   busy,
   onNewChat,
   onSelect,
+  onDelete,
 }: SidebarProps) {
   return (
     <>
@@ -45,7 +47,7 @@ export function Sidebar({
       )}
       <aside
         className={cn(
-          'fixed inset-y-0 left-0 z-30 flex w-72 flex-col border-r border-white/8 bg-black/35 backdrop-blur-2xl transition-transform duration-200 lg:relative lg:z-auto lg:translate-x-0',
+          'fixed inset-y-0 left-0 z-30 flex w-72 flex-col border-r border-border bg-[var(--sidebar-bg)] backdrop-blur-2xl transition-transform duration-200 lg:relative lg:z-auto lg:translate-x-0',
           open ? 'translate-x-0' : '-translate-x-full',
         )}
       >
@@ -84,31 +86,61 @@ export function Sidebar({
             </p>
           )}
           {history.map((item) => (
-            <button
+            <div
               key={item.file}
-              type="button"
-              onClick={() => onSelect(item.file)}
               className={cn(
-                'group w-full cursor-pointer rounded-xl px-3 py-2.5 text-left transition',
+                'group flex items-center justify-between gap-1.5 rounded-xl px-3 py-2 transition',
                 item.current
                   ? 'bg-white/10 shadow-sm shadow-primary/10'
                   : 'hover:bg-white/6',
               )}
             >
-              <div className="flex items-center justify-between gap-2">
-                <span
-                  className={cn(
-                    'truncate text-[13px]',
-                    item.current ? 'text-foreground' : 'text-foreground/75',
-                  )}
-                >
-                  {item.title}
-                </span>
-                <span className="shrink-0 text-[10px] text-muted-foreground/70">
+              <button
+                type="button"
+                onClick={() => {
+                  if (item.current) {
+                    onClose()
+                    return
+                  }
+                  onSelect(item.file)
+                }}
+                disabled={busy}
+                className={cn(
+                  'flex min-w-0 flex-1 flex-col text-left disabled:cursor-not-allowed',
+                  item.current ? 'cursor-default' : 'cursor-pointer',
+                )}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span
+                    className={cn(
+                      'truncate text-[13px]',
+                      item.current ? 'text-foreground' : 'text-foreground/75',
+                    )}
+                  >
+                    {item.title}
+                  </span>
+                  <span className="shrink-0 text-[10px] text-muted-foreground/70 group-hover:hidden max-lg:hidden">
+                    {formatTime(item.mtime)}
+                  </span>
+                </div>
+                <span className="text-[10px] text-muted-foreground/60 lg:hidden">
                   {formatTime(item.mtime)}
                 </span>
-              </div>
-            </button>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onDelete(item.file)
+                }}
+                disabled={busy}
+                title="删除会话"
+                aria-label="删除会话"
+                className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-muted-foreground/50 transition hover:bg-destructive/15 hover:text-destructive focus:opacity-100 max-lg:opacity-80 lg:opacity-0 lg:group-hover:opacity-100 disabled:pointer-events-none"
+              >
+                <Trash2 className="size-3.5" />
+              </button>
+            </div>
           ))}
         </nav>
 

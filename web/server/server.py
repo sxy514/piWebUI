@@ -91,6 +91,11 @@ class SwitchRequest(BaseModel):
     session_file: str
 
 
+class DeleteSessionRequest(BaseModel):
+    client_id: str
+    session_file: str
+
+
 def sse(payload: dict[str, Any]) -> str:
     frame = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     return clean_text(frame)
@@ -511,3 +516,34 @@ async def switch_session_endpoint(req: SwitchRequest) -> dict[str, Any]:
         "session_file": state.get("sessionFile"),
         "session_id": state.get("sessionId"),
     }
+
+
+@app.post("/api/history/delete")
+async def delete_session_endpoint(req: DeleteSessionRequest) -> dict[str, Any]:
+    client = _clients.get(req.client_id)
+    if client is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    lock = get_lock(req.client_id)
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="回答进行中, 请先停止")
+    target = Path(req.session_file).resolve()
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="会话文件不存在")
+    if target.suffix != ".jsonl":
+        raise HTTPException(status_code=400, detail="非法会话文件格式")
+
+    state = await client.get_state()
+    current_file = state.get("sessionFile")
+    was_current = bool(current_file and target == Path(current_file).resolve())
+
+    if was_current:
+        # 如果删除的是当前活动会话，先创建一个新会话解除写入锁定
+        await client.new_session()
+
+    try:
+        target.unlink(missing_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"删除会话文件失败: {exc}") from exc
+
+    return {"ok": True, "was_current": was_current}
+
