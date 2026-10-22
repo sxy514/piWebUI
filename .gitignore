@@ -26,5 +26,6 @@ Thumbs.db
 *.log
 npm-debug.log*
 
-# pi 本地数据
-.pi/
+# pi 运行时临时数据与会话文件（忽略会话数据，但保留项目内置扩展）
+.pi/*
+!.pi/extensions/

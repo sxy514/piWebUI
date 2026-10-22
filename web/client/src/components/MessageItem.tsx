@@ -3,15 +3,21 @@ import { Markdown } from '@/components/Markdown'
 import { Spinner } from '@/components/ui/spinner'
 import type { Message, Part } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { Check, ChevronRight, Copy, RefreshCw, TriangleAlert, Wrench } from 'lucide-react'
+import { Check, ChevronRight, Copy, RefreshCw, ShieldAlert, TriangleAlert, Wrench, X } from 'lucide-react'
 
 interface MessageItemProps {
   msg: Message
   isLastAssistant: boolean
   onRegenerate?: () => void
+  onConfirm?: (confirmId: string, approved: boolean) => void
 }
 
-export function MessageItem({ msg, isLastAssistant, onRegenerate }: MessageItemProps) {
+export function MessageItem({
+  msg,
+  isLastAssistant,
+  onRegenerate,
+  onConfirm,
+}: MessageItemProps) {
   if (msg.role === 'user') {
     const text = msg.parts.map((p) => (p.kind === 'text' ? p.text : '')).join('')
     return (
@@ -39,6 +45,7 @@ export function MessageItem({ msg, isLastAssistant, onRegenerate }: MessageItemP
           part={part}
           streaming={msg.streaming}
           isLastPart={i === msg.parts.length - 1}
+          onConfirm={onConfirm}
         />
       ))}
 
@@ -82,10 +89,12 @@ function PartView({
   part,
   streaming,
   isLastPart,
+  onConfirm,
 }: {
   part: Part
   streaming: boolean
   isLastPart: boolean
+  onConfirm?: (confirmId: string, approved: boolean) => void
 }) {
   if (part.kind === 'thinking') {
     return <ThinkingView text={part.text} streaming={streaming} />
@@ -93,9 +102,92 @@ function PartView({
   if (part.kind === 'tool') {
     return <ToolView part={part} />
   }
+  if (part.kind === 'confirm') {
+    return <ConfirmView part={part} onConfirm={onConfirm} />
+  }
   return (
     <div className={cn('my-1', streaming && isLastPart && 'caret')}>
       <Markdown text={part.text} mermaidEnabled={!streaming} />
+    </div>
+  )
+}
+
+function ConfirmView({
+  part,
+  onConfirm,
+}: {
+  part: Extract<Part, { kind: 'confirm' }>
+  onConfirm?: (confirmId: string, approved: boolean) => void
+}) {
+  const isDangerous = part.is_dangerous
+  const isPending = part.status === 'pending'
+  const isApproved = part.status === 'approved'
+  const isDenied = part.status === 'denied'
+
+  return (
+    <div
+      className={cn(
+        'mb-3 overflow-hidden rounded-xl border p-4 text-xs transition-all',
+        isPending && (isDangerous ? 'border-amber-500/40 bg-amber-500/10' : 'border-blue-500/30 bg-blue-500/10'),
+        isApproved && 'border-emerald-500/30 bg-emerald-500/5',
+        isDenied && 'border-destructive/30 bg-destructive/5',
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <ShieldAlert
+          className={cn(
+            'size-4 shrink-0',
+            isDangerous ? 'text-amber-400' : 'text-blue-400',
+            isApproved && 'text-emerald-400',
+            isDenied && 'text-destructive',
+          )}
+        />
+        <span className="font-semibold text-foreground/90">
+          {part.title || (isDangerous ? '高危命令执行确认' : '工具执行确认')}
+        </span>
+        <div className="ml-auto">
+          {isApproved && (
+            <span className="rounded bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-400">
+              已允许
+            </span>
+          )}
+          {isDenied && (
+            <span className="rounded bg-destructive/20 px-2 py-0.5 text-[11px] font-medium text-destructive">
+              已拒绝
+            </span>
+          )}
+          {isPending && (
+            <span className="rounded bg-amber-500/20 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+              等待审核
+            </span>
+          )}
+        </div>
+      </div>
+
+      {part.message && (
+        <div className="mt-2.5 rounded-lg border border-white/6 bg-black/40 p-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-foreground/80">
+          {part.message}
+        </div>
+      )}
+
+      {isPending && onConfirm && (
+        <div className="mt-3 flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => onConfirm(part.confirm_id, false)}
+            className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:bg-destructive/20 hover:text-destructive"
+          >
+            <X className="size-3.5" /> 拒绝
+          </button>
+          <button
+            type="button"
+            onClick={() => onConfirm(part.confirm_id, true)}
+            className="flex cursor-pointer items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white shadow transition hover:bg-emerald-500"
+          >
+            <Check className="size-3.5" /> 允许执行
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -221,7 +313,7 @@ function summarizeArgs(args: unknown): string {
 
 function plainText(msg: Message): string {
   return msg.parts
-    .map((p) => (p.kind === 'text' || p.kind === 'thinking' ? p.text : ''))
+    .map((p) => (p.kind === 'text' ? p.text : ''))
     .join('')
     .trim()
 }

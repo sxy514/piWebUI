@@ -1,39 +1,38 @@
-export interface SessionInfo {
-  client_id: string
-  model: string
-  session_id: string | null
-}
-
-export interface UsageInfo {
-  input_tokens: number | null
-  output_tokens: number | null
-  total_tokens: number | null
-  cost: number | null
-}
-
-export interface ToolPart {
-  kind: 'tool'
-  name: string
-  args?: unknown
-  result?: string
-  ok?: boolean
-  done: boolean
-}
-
-export type Part =
-  | { kind: 'text'; text: string }
-  | { kind: 'thinking'; text: string }
-  | ToolPart
-
 export interface Message {
   id: string
   role: 'user' | 'assistant'
   parts: Part[]
   streaming: boolean
-  error?: string
-  interrupted?: boolean
   usage?: UsageInfo | null
   elapsed?: number
+  interrupted?: boolean
+  error?: string
+}
+
+export type Part =
+  | { kind: 'text'; text: string }
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool'; name: string; args?: unknown; done: boolean; ok?: boolean; result?: string }
+  | {
+      kind: 'confirm'
+      confirm_id: string
+      title: string
+      message: string
+      status: 'pending' | 'approved' | 'denied'
+      is_dangerous?: boolean
+    }
+
+export interface UsageInfo {
+  input_tokens?: number | null
+  output_tokens?: number | null
+  total_tokens?: number | null
+  cost?: number | null
+}
+
+export interface SessionInfo {
+  client_id: string
+  model: string
+  session_id: string | null
 }
 
 export interface HistoryItem {
@@ -43,16 +42,16 @@ export interface HistoryItem {
   current: boolean
 }
 
-export interface MessagesPayload {
-  messages: Message[]
-  session_file: string | null
-  session_id: string | null
-}
-
 export interface ModelItem {
   id: string
   name: string
   provider: string
+}
+
+export interface MessagesPayload {
+  messages: Message[]
+  session_file: string | null
+  session_id: string | null
 }
 
 export type StreamEvent =
@@ -68,16 +67,100 @@ export type StreamEvent =
       usage: UsageInfo | null
       session_id: string | null
     }
+  | {
+      type: 'confirm_request'
+      confirm_id: string
+      title: string
+      message: string
+      is_dangerous?: boolean
+    }
   | { type: 'interrupted' }
   | { type: 'error'; message: string }
 
+let authToken = ''
+let authRememberMode = 'true'
+
+export function setAuthToken(token: string, mode: string = authRememberMode) {
+  authToken = token.trim()
+  authRememberMode = mode
+  if (authToken) {
+    if (mode === 'true' || mode === 'local') {
+      localStorage.setItem('pi_auth_token', authToken)
+      sessionStorage.removeItem('pi_auth_token')
+    } else if (mode === 'session') {
+      sessionStorage.setItem('pi_auth_token', authToken)
+      localStorage.removeItem('pi_auth_token')
+    } else {
+      localStorage.removeItem('pi_auth_token')
+      sessionStorage.removeItem('pi_auth_token')
+    }
+  } else {
+    localStorage.removeItem('pi_auth_token')
+    sessionStorage.removeItem('pi_auth_token')
+  }
+}
+
+export function initAuthToken(mode: string = 'true') {
+  authRememberMode = mode
+  if (mode === 'true' || mode === 'local') {
+    authToken = localStorage.getItem('pi_auth_token') || ''
+  } else if (mode === 'session') {
+    authToken = sessionStorage.getItem('pi_auth_token') || ''
+    localStorage.removeItem('pi_auth_token')
+  } else {
+    authToken = ''
+    localStorage.removeItem('pi_auth_token')
+    sessionStorage.removeItem('pi_auth_token')
+  }
+}
+
+export function getAuthToken(): string {
+  return authToken
+}
+
+export async function getAuthStatus(): Promise<{ auth_required: boolean; auth_remember?: string }> {
+  try {
+    const res = await fetch('/api/auth/status')
+    if (res.ok) {
+      return res.json()
+    }
+  } catch {
+    /* ignore network error */
+  }
+  return { auth_required: false }
+}
+
+export async function verifyAuthToken(token: string): Promise<boolean> {
+  const res = await fetch('/api/auth/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  })
+  if (res.ok) {
+    setAuthToken(token, authRememberMode)
+    return true
+  }
+  return false
+}
+
+function authFetch(url: string, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(init?.headers)
+  if (authToken) {
+    headers.set('Authorization', `Bearer ${authToken}`)
+  }
+  return fetch(url, { ...init, headers })
+}
+
 async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const resp = await fetch(url, {
+  const resp = await authFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
   if (!resp.ok) {
+    if (resp.status === 401) {
+      window.dispatchEvent(new CustomEvent('pi-unauthorized'))
+    }
     let detail = resp.statusText
     try {
       const data = await resp.json()
@@ -90,8 +173,12 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   return resp.json() as Promise<T>
 }
 
-export function createSession(): Promise<SessionInfo> {
-  return postJson<SessionInfo>('/api/session', {})
+export function createSession(clientId?: string): Promise<SessionInfo> {
+  return postJson<SessionInfo>('/api/session', { client_id: clientId ?? null })
+}
+
+export function closeSession(clientId: string): Promise<{ ok: boolean }> {
+  return postJson('/api/session/close', { client_id: clientId })
 }
 
 export function newSession(
@@ -100,16 +187,26 @@ export function newSession(
   return postJson('/api/new', { client_id: clientId })
 }
 
+export function forkSession(clientId: string): Promise<{
+  ok: boolean
+  prompt: string
+  messages: Message[]
+  session_file: string | null
+  session_id: string | null
+}> {
+  return postJson('/api/fork', { client_id: clientId })
+}
+
 export function getHistory(
   clientId: string,
 ): Promise<{ current: string | null; items: HistoryItem[] }> {
-  return fetch(`/api/history?client_id=${encodeURIComponent(clientId)}`).then(
+  return authFetch(`/api/history?client_id=${encodeURIComponent(clientId)}`).then(
     (r) => r.json(),
   )
 }
 
 export function getMessages(clientId: string): Promise<MessagesPayload> {
-  return fetch(`/api/messages?client_id=${encodeURIComponent(clientId)}`).then(
+  return authFetch(`/api/messages?client_id=${encodeURIComponent(clientId)}`).then(
     (r) => r.json(),
   )
 }
@@ -129,7 +226,7 @@ export function deleteSession(
 }
 
 export function getModels(): Promise<ModelItem[]> {
-  return fetch('/api/models').then((r) => r.json())
+  return authFetch('/api/models').then((r) => r.json())
 }
 
 export function setModel(
@@ -148,17 +245,32 @@ export function interrupt(clientId: string): Promise<{ ok: boolean }> {
   return postJson('/api/interrupt', { client_id: clientId })
 }
 
+export function sendConfirm(
+  clientId: string,
+  confirmId: string,
+  approved: boolean,
+): Promise<{ ok: boolean }> {
+  return postJson('/api/confirm', {
+    client_id: clientId,
+    confirm_id: confirmId,
+    approved,
+  })
+}
+
 export async function sendChat(
   clientId: string,
   message: string,
   onEvent: (event: StreamEvent) => void,
 ): Promise<void> {
-  const resp = await fetch('/api/chat', {
+  const resp = await authFetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ client_id: clientId, message }),
   })
   if (!resp.ok || !resp.body) {
+    if (resp.status === 401) {
+      window.dispatchEvent(new CustomEvent('pi-unauthorized'))
+    }
     let detail = resp.statusText
     try {
       const data = await resp.json()

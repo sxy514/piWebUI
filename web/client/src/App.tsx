@@ -6,14 +6,22 @@ import { ModelMenu } from '@/components/ModelMenu'
 import { Sidebar } from '@/components/Sidebar'
 import { ThemeMenu } from '@/components/ThemeMenu'
 import { Spinner } from '@/components/ui/spinner'
+import { AuthModal } from '@/components/AuthModal'
 import {
   createSession,
+  getAuthStatus,
+  getAuthToken,
+  initAuthToken,
+  verifyAuthToken,
   deleteSession,
+  forkSession,
   getHistory,
+  getMessages,
   getModels,
   interrupt,
   newSession,
   sendChat,
+  sendConfirm,
   setModel,
   switchSession,
   type HistoryItem,
@@ -38,6 +46,8 @@ export default function App() {
   const [models, setModels] = useState<ModelItem[]>([])
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [switching, setSwitching] = useState(false)
+  const [needAuth, setNeedAuth] = useState(false)
+  const [authRemember, setAuthRemember] = useState<string>('true')
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -52,22 +62,53 @@ export default function App() {
     }
   }, [])
 
+  const bootSession = useCallback(async () => {
+    try {
+      setBootError(null)
+      const auth = await getAuthStatus()
+      if (auth.auth_required) {
+        const mode = auth.auth_remember || 'true'
+        setAuthRemember(mode)
+        initAuthToken(mode)
+        const token = getAuthToken()
+        if (!token) {
+          setNeedAuth(true)
+          return
+        }
+      }
+
+      const storedClientId = localStorage.getItem('pi_client_id') || undefined
+      const info = await createSession(storedClientId)
+      localStorage.setItem('pi_client_id', info.client_id)
+      setSession(info)
+      setNeedAuth(false)
+      const [msgsRes] = await Promise.all([
+        getMessages(info.client_id).catch(() => null),
+        refreshHistory(info.client_id),
+        getModels().then(setModels).catch(() => undefined),
+      ])
+      if (msgsRes && msgsRes.messages && msgsRes.messages.length > 0) {
+        setMessages(msgsRes.messages)
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('401') || msg.includes('密码')) {
+        setNeedAuth(true)
+      } else {
+        setBootError(msg)
+      }
+    }
+  }, [refreshHistory])
+
   useEffect(() => {
     if (booted.current) return
     booted.current = true
-    ;(async () => {
-      try {
-        const info = await createSession()
-        setSession(info)
-        await Promise.all([
-          refreshHistory(info.client_id),
-          getModels().then(setModels).catch(() => undefined),
-        ])
-      } catch (err) {
-        setBootError(err instanceof Error ? err.message : String(err))
-      }
-    })()
-  }, [refreshHistory])
+    void bootSession()
+
+    const onUnauthorized = () => setNeedAuth(true)
+    window.addEventListener('pi-unauthorized', onUnauthorized)
+    return () => window.removeEventListener('pi-unauthorized', onUnauthorized)
+  }, [bootSession])
 
   useEffect(() => {
     const el = scrollRef.current
@@ -155,6 +196,22 @@ export default function App() {
             return { ...msg, parts }
           })
           break
+        case 'confirm_request':
+          patchLastAssistant((msg) => ({
+            ...msg,
+            parts: [
+              ...msg.parts,
+              {
+                kind: 'confirm',
+                confirm_id: event.confirm_id,
+                title: event.title,
+                message: event.message,
+                status: 'pending',
+                is_dangerous: event.is_dangerous,
+              },
+            ],
+          }))
+          break
         case 'done':
           patchLastAssistant((msg) => ({
             ...msg,
@@ -176,6 +233,34 @@ export default function App() {
       }
     },
     [patchLastAssistant],
+  )
+
+  const handleConfirm = useCallback(
+    async (confirmId: string, approved: boolean) => {
+      if (!session) return
+      setMessages((prev) =>
+        prev.map((msg) => {
+          const hasConfirm = msg.parts.some(
+            (p) => p.kind === 'confirm' && p.confirm_id === confirmId,
+          )
+          if (!hasConfirm) return msg
+          return {
+            ...msg,
+            parts: msg.parts.map((p) =>
+              p.kind === 'confirm' && p.confirm_id === confirmId
+                ? { ...p, status: approved ? ('approved' as const) : ('denied' as const) }
+                : p,
+            ),
+          }
+        }),
+      )
+      try {
+        await sendConfirm(session.client_id, confirmId, approved)
+      } catch (err) {
+        console.error('Failed to send confirm decision:', err)
+      }
+    },
+    [session],
   )
 
   const doSend = useCallback(
@@ -231,7 +316,9 @@ export default function App() {
     void doSend(text, true)
   }, [input, doSend])
 
-  const regenerate = useCallback(() => {
+  const regenerate = useCallback(async () => {
+    if (!session || streaming) return
+
     let lastUser: Message | undefined
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'user') {
@@ -239,20 +326,38 @@ export default function App() {
         break
       }
     }
-    if (!lastUser || streaming) return
-    const text = lastUser.parts
+    if (!lastUser) return
+    const fallbackText = lastUser.parts
       .map((p) => (p.kind === 'text' ? p.text : ''))
       .join('')
       .trim()
-    if (!text) return
+    if (!fallbackText) return
 
-    setMessages((prev) => {
-      const next = [...prev]
-      if (next.length && next[next.length - 1].role === 'assistant') next.pop()
-      return next
-    })
-    void doSend(text, false)
-  }, [messages, streaming, doSend])
+    try {
+      // 通过 pi 原生 fork 分叉，将当前会话切到该 user 提问节点，丢弃旧的 assistant 回复分支
+      const forkRes = await forkSession(session.client_id)
+      if (forkRes.messages?.length) {
+        setMessages(forkRes.messages)
+      } else {
+        setMessages((prev) => {
+          const next = [...prev]
+          if (next.length && next[next.length - 1].role === 'assistant') next.pop()
+          return next
+        })
+      }
+      await refreshHistory(session.client_id)
+      const promptToRun = forkRes.prompt || fallbackText
+      void doSend(promptToRun, false)
+    } catch {
+      // 兜底降级处理
+      setMessages((prev) => {
+        const next = [...prev]
+        if (next.length && next[next.length - 1].role === 'assistant') next.pop()
+        return next
+      })
+      void doSend(fallbackText, false)
+    }
+  }, [session, messages, streaming, doSend, refreshHistory])
 
   const handleStop = useCallback(async () => {
     if (!session) return
@@ -353,6 +458,21 @@ export default function App() {
     )
   }
 
+  if (needAuth && !session) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <AuthModal
+          rememberMode={authRemember}
+          onSuccess={() => {
+            setNeedAuth(false)
+            void bootSession()
+          }}
+          onVerify={verifyAuthToken}
+        />
+      </div>
+    )
+  }
+
   if (!session) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -446,6 +566,7 @@ export default function App() {
                         key={msg.id}
                         msg={msg}
                         isLastAssistant={msg.id === lastAssistantId}
+                        onConfirm={handleConfirm}
                         onRegenerate={
                           msg.role === 'assistant' && msg.id === lastAssistantId
                             ? regenerate
@@ -482,6 +603,17 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {needAuth && (
+        <AuthModal
+          rememberMode={authRemember}
+          onSuccess={() => {
+            setNeedAuth(false)
+            void bootSession()
+          }}
+          onVerify={verifyAuthToken}
+        />
+      )}
     </div>
   )
 }
