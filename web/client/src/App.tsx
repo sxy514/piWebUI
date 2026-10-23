@@ -10,9 +10,7 @@ import { AuthModal } from '@/components/AuthModal'
 import {
   createSession,
   getAuthStatus,
-  getAuthToken,
   initAuthToken,
-  verifyAuthToken,
   deleteSession,
   forkSession,
   getHistory,
@@ -22,6 +20,9 @@ import {
   newSession,
   sendChat,
   sendConfirm,
+  getMe,
+  logoutUser,
+  type UserInfo,
   setModel,
   switchSession,
   type HistoryItem,
@@ -31,7 +32,7 @@ import {
   type StreamEvent,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { CircleAlert, Menu, Plus } from 'lucide-react'
+import { CircleAlert, LogOut, Menu, Plus, User as UserIcon } from 'lucide-react'
 
 let msgSeq = 0
 const newId = () => `m${++msgSeq}`
@@ -48,6 +49,8 @@ export default function App() {
   const [switching, setSwitching] = useState(false)
   const [needAuth, setNeedAuth] = useState(false)
   const [authRemember, setAuthRemember] = useState<string>('true')
+  const [currentUser, setCurrentUser] = useState<UserInfo | null>(null)
+  const [hasUsers, setHasUsers] = useState<boolean>(true)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -66,22 +69,25 @@ export default function App() {
     try {
       setBootError(null)
       const auth = await getAuthStatus()
-      if (auth.auth_required) {
-        const mode = auth.auth_remember || 'true'
-        setAuthRemember(mode)
-        initAuthToken(mode)
-        const token = getAuthToken()
-        if (!token) {
-          setNeedAuth(true)
-          return
-        }
+      setHasUsers(auth.has_users)
+      const mode = auth.auth_remember || 'true'
+      setAuthRemember(mode)
+      initAuthToken(mode)
+
+      // 获取并验证当前用户信息
+      const user = await getMe()
+      if (!user) {
+        setNeedAuth(true)
+        return
       }
+      setCurrentUser(user)
+      setNeedAuth(false)
 
       const storedClientId = localStorage.getItem('pi_client_id') || undefined
       const info = await createSession(storedClientId)
       localStorage.setItem('pi_client_id', info.client_id)
       setSession(info)
-      setNeedAuth(false)
+
       const [msgsRes] = await Promise.all([
         getMessages(info.client_id).catch(() => null),
         refreshHistory(info.client_id),
@@ -92,13 +98,21 @@ export default function App() {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      if (msg.includes('401') || msg.includes('密码')) {
+      if (msg.includes('401') || msg.includes('登录') || msg.includes('凭证')) {
         setNeedAuth(true)
       } else {
         setBootError(msg)
       }
     }
   }, [refreshHistory])
+
+  const handleLogout = useCallback(async () => {
+    await logoutUser()
+    setCurrentUser(null)
+    setSession(null)
+    setMessages([])
+    setNeedAuth(true)
+  }, [])
 
   useEffect(() => {
     if (booted.current) return
@@ -212,22 +226,51 @@ export default function App() {
             ],
           }))
           break
+        case 'confirm_timeout':
+          patchLastAssistant((msg) => ({
+            ...msg,
+            parts: msg.parts.map((p) =>
+              p.kind === 'confirm' && p.confirm_id === event.confirm_id
+                ? { ...p, status: 'expired' as const }
+                : p,
+            ),
+          }))
+          break
         case 'done':
           patchLastAssistant((msg) => ({
             ...msg,
             streaming: false,
             usage: event.usage,
             elapsed: event.elapsed,
+            parts: msg.parts.map((p) =>
+              p.kind === 'confirm' && p.status === 'pending'
+                ? { ...p, status: 'expired' as const }
+                : p,
+            ),
           }))
           break
         case 'interrupted':
-          patchLastAssistant((msg) => ({ ...msg, streaming: false, interrupted: true }))
+          patchLastAssistant((msg) => ({
+            ...msg,
+            streaming: false,
+            interrupted: true,
+            parts: msg.parts.map((p) =>
+              p.kind === 'confirm' && p.status === 'pending'
+                ? { ...p, status: 'expired' as const }
+                : p,
+            ),
+          }))
           break
         case 'error':
           patchLastAssistant((msg) => ({
             ...msg,
             streaming: false,
             error: event.message,
+            parts: msg.parts.map((p) =>
+              p.kind === 'confirm' && p.status === 'pending'
+                ? { ...p, status: 'expired' as const }
+                : p,
+            ),
           }))
           break
       }
@@ -238,24 +281,37 @@ export default function App() {
   const handleConfirm = useCallback(
     async (confirmId: string, approved: boolean) => {
       if (!session) return
-      setMessages((prev) =>
-        prev.map((msg) => {
-          const hasConfirm = msg.parts.some(
-            (p) => p.kind === 'confirm' && p.confirm_id === confirmId,
-          )
-          if (!hasConfirm) return msg
-          return {
-            ...msg,
-            parts: msg.parts.map((p) =>
-              p.kind === 'confirm' && p.confirm_id === confirmId
-                ? { ...p, status: approved ? ('approved' as const) : ('denied' as const) }
-                : p,
-            ),
-          }
-        }),
-      )
       try {
-        await sendConfirm(session.client_id, confirmId, approved)
+        const res = await sendConfirm(session.client_id, confirmId, approved)
+        if (res.expired) {
+          setMessages((prev) =>
+            prev.map((msg) => ({
+              ...msg,
+              parts: msg.parts.map((p) =>
+                p.kind === 'confirm' && p.confirm_id === confirmId
+                  ? { ...p, status: 'expired' as const }
+                  : p,
+              ),
+            })),
+          )
+          return
+        }
+        setMessages((prev) =>
+          prev.map((msg) => {
+            const hasConfirm = msg.parts.some(
+              (p) => p.kind === 'confirm' && p.confirm_id === confirmId,
+            )
+            if (!hasConfirm) return msg
+            return {
+              ...msg,
+              parts: msg.parts.map((p) =>
+                p.kind === 'confirm' && p.confirm_id === confirmId
+                  ? { ...p, status: approved ? ('approved' as const) : ('denied' as const) }
+                  : p,
+              ),
+            }
+          }),
+        )
       } catch (err) {
         console.error('Failed to send confirm decision:', err)
       }
@@ -303,6 +359,14 @@ export default function App() {
         }))
       } finally {
         setStreaming(false)
+        patchLastAssistant((msg) => ({
+          ...msg,
+          parts: msg.parts.map((p) =>
+            p.kind === 'confirm' && p.status === 'pending'
+              ? { ...p, status: 'expired' as const }
+              : p,
+          ),
+        }))
         void refreshHistory(session.client_id)
       }
     },
@@ -462,12 +526,13 @@ export default function App() {
     return (
       <div className="flex h-full items-center justify-center">
         <AuthModal
+          hasUsers={hasUsers}
           rememberMode={authRemember}
-          onSuccess={() => {
+          onSuccess={(user) => {
+            setCurrentUser(user)
             setNeedAuth(false)
             void bootSession()
           }}
-          onVerify={verifyAuthToken}
         />
       </div>
     )
@@ -499,6 +564,8 @@ export default function App() {
           history={history}
           model={session.model}
           busy={streaming || switching}
+          currentUser={currentUser}
+          onLogout={() => void handleLogout()}
           onNewChat={() => void handleNewChat()}
           onSelect={(file) => void handleSelectHistory(file)}
           onDelete={(file) => void handleDeleteHistory(file)}
@@ -533,6 +600,25 @@ export default function App() {
                 />
                 {streaming ? '生成中' : '就绪'}
               </span>
+              {currentUser && (
+                <div className="hidden items-center gap-1.5 rounded-full border border-white/10 bg-white/6 px-2.5 py-1 text-xs sm:flex">
+                  <UserIcon className="size-3.5 text-primary" />
+                  <span className="font-medium text-foreground/90">{currentUser.username}</span>
+                  {currentUser.role === 'admin' && (
+                    <span className="rounded bg-primary/20 px-1 py-0.2 text-[10px] font-semibold text-primary">
+                      管理员
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void handleLogout()}
+                    title="退出登录"
+                    className="ml-1 cursor-pointer text-muted-foreground transition hover:text-destructive"
+                  >
+                    <LogOut className="size-3.5" />
+                  </button>
+                </div>
+              )}
               <ThemeMenu />
               <button
                 type="button"
@@ -606,12 +692,13 @@ export default function App() {
 
       {needAuth && (
         <AuthModal
+          hasUsers={hasUsers}
           rememberMode={authRemember}
-          onSuccess={() => {
+          onSuccess={(user) => {
+            setCurrentUser(user)
             setNeedAuth(false)
             void bootSession()
           }}
-          onVerify={verifyAuthToken}
         />
       )}
     </div>

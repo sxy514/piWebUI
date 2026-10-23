@@ -123,6 +123,7 @@ function ConfirmView({
   const isPending = part.status === 'pending'
   const isApproved = part.status === 'approved'
   const isDenied = part.status === 'denied'
+  const isExpired = part.status === 'expired'
 
   return (
     <div
@@ -131,6 +132,7 @@ function ConfirmView({
         isPending && (isDangerous ? 'border-amber-500/40 bg-amber-500/10' : 'border-blue-500/30 bg-blue-500/10'),
         isApproved && 'border-emerald-500/30 bg-emerald-500/5',
         isDenied && 'border-destructive/30 bg-destructive/5',
+        isExpired && 'border-white/10 bg-white/[0.02] opacity-75',
       )}
     >
       <div className="flex items-center gap-2">
@@ -140,6 +142,7 @@ function ConfirmView({
             isDangerous ? 'text-amber-400' : 'text-blue-400',
             isApproved && 'text-emerald-400',
             isDenied && 'text-destructive',
+            isExpired && 'text-muted-foreground',
           )}
         />
         <span className="font-semibold text-foreground/90">
@@ -154,6 +157,11 @@ function ConfirmView({
           {isDenied && (
             <span className="rounded bg-destructive/20 px-2 py-0.5 text-[11px] font-medium text-destructive">
               已拒绝
+            </span>
+          )}
+          {isExpired && (
+            <span className="rounded bg-white/10 px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+              已超时 (已取消)
             </span>
           )}
           {isPending && (

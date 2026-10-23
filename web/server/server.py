@@ -1,4 +1,4 @@
-"""pi web chat 后端: FastAPI + pi-agent-python-sdk, SSE 流式输出。
+"""pi web chat 后端: FastAPI + pi-agent-python-sdk, 多用户系统与私有工作区隔离。
 
 启动 (在 piWeb 环境):
     python -m uvicorn server:app --host 127.0.0.1 --port 8000
@@ -18,11 +18,27 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from pi_agent import AsyncPiClient, Event, Limits, PiBusyError, PiError, PiRunError
+
+from db import (
+    init_db,
+    count_users,
+    create_user,
+    get_user_by_id,
+    get_user_by_username,
+    record_audit,
+    User,
+)
+from auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_access_token,
+)
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 RUN_TIMEOUT = 300.0
@@ -82,29 +98,30 @@ def ensure_extensions():
     ext_dir.mkdir(parents=True, exist_ok=True)
     target_ext = ext_dir / "web_approval.js"
     source_ext = Path(__file__).resolve().parent / "extensions" / "web_approval.js"
-    if source_ext.is_file() and not target_ext.is_file():
-        shutil.copy2(source_ext, target_ext)
-        log.info("已自动为当前环境就绪工具审核扩展: %s", target_ext)
+    if source_ext.is_file():
+        # 若目标文件不存在或源文件更新，自动同步覆盖
+        if not target_ext.is_file() or source_ext.stat().st_mtime > target_ext.stat().st_mtime:
+            shutil.copy2(source_ext, target_ext)
+            log.info("已自动为当前环境就绪/更新工具审核扩展: %s", target_ext)
 
 
 ensure_extensions()
 
-# 访问密码与安全配置
-AUTH_TOKEN = os.environ.get("PI_AUTH_TOKEN", "").strip()
+# 系统安全与策略配置
 CLIENT_IDLE_TIMEOUT = float(os.environ.get("PI_CLIENT_IDLE_TIMEOUT", "1800.0"))  # 默认 30 分钟无请求自动回收子进程
 # 审核策略：'safe' (常规放行, 高危确认) / 'manual' (每次执行均在网页端手动确认) / 'deny' (全拒绝) / 'allow_all' (全放行)
 AUTO_APPROVE_POLICY = os.environ.get("PI_AUTO_APPROVE_POLICY", "safe").lower()
 # 客户端密码保存模式：'true'/'local' (长期记住), 'session' (会话级别), 'false'/'none' (完全不缓存)
 AUTH_REMEMBER = os.environ.get("PI_AUTH_REMEMBER", "true").lower()
+# 等待用户审核超时时间（秒）
+APPROVAL_TIMEOUT = float(os.environ.get("PI_APPROVAL_TIMEOUT", "60.0"))
+# 自定义工作目录配置（可选）
+PI_WORKSPACE_DIR = os.environ.get("PI_WORKSPACE_DIR", "").strip()
 
-if AUTH_TOKEN:
-    log.info("🔐 访问密码保护已开启 (PI_AUTH_TOKEN 已配置)")
-else:
-    log.info("🔓 未配置 PI_AUTH_TOKEN，免密模式运行")
-
-log.info("🛡️ 工具确认审核策略: %s", AUTO_APPROVE_POLICY)
-if AUTH_TOKEN:
-    log.info("💾 客户端密码记住模式: %s", AUTH_REMEMBER)
+log.info("🛡️ 工具确认审核策略: %s (超时: %.0f秒)", AUTO_APPROVE_POLICY, APPROVAL_TIMEOUT)
+log.info("💾 客户端登录保持模式: %s", AUTH_REMEMBER)
+if PI_WORKSPACE_DIR:
+    log.info("📂 自定义工作目录基准: %s", PI_WORKSPACE_DIR)
 
 DANGEROUS_COMMAND_PATTERNS = [
     # 破坏性文件/磁盘删除
@@ -138,68 +155,70 @@ _pending_confirms: dict[str, asyncio.Future[bool]] = {}
 _active_sse_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 
 
-def touch_client(client_id: str) -> None:
+def touch_client(client_key: str) -> None:
     """更新客户端最近活跃时间。"""
-    _client_last_active[client_id] = time.time()
+    _client_last_active[client_key] = time.time()
 
 
-async def close_client(client_id: str) -> None:
-    """安全关闭指定客户端并清理所有子进程资源。"""
-    client = _clients.pop(client_id, None)
-    _client_locks.pop(client_id, None)
-    _client_last_active.pop(client_id, None)
-    _active_sse_queues.pop(client_id, None)
-    if client is not None:
-        try:
-            await client.aclose()
-            log.info("Client %s closed successfully", client_id)
-        except Exception as exc:
-            log.warning("Error closing client %s: %s", client_id, exc)
-
-
-async def _cleanup_idle_clients():
-    """后台任务：定期检查并释放空闲超时的 pi 子进程，杜绝进程泄漏。"""
+async def clean_idle_clients():
+    """定期清理长时间无活动的客户端，优雅关闭 underlying node 进程以防资源泄漏。"""
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(60)  # 每分钟巡检一次
             now = time.time()
-            expired = [
-                cid
-                for cid, last_active in list(_client_last_active.items())
-                if (now - last_active > CLIENT_IDLE_TIMEOUT)
-                and not (_client_locks.get(cid) and _client_locks[cid].locked())
+            idle_keys = [
+                key
+                for key, last_time in _client_last_active.items()
+                if now - last_time > CLIENT_IDLE_TIMEOUT
             ]
-            for cid in expired:
-                log.info(
-                    "Client %s 超时空闲 (>%s秒), 正在自动释放子进程...",
-                    cid,
-                    CLIENT_IDLE_TIMEOUT,
-                )
-                await close_client(cid)
+            for key in idle_keys:
+                client = _clients.pop(key, None)
+                _client_locks.pop(key, None)
+                _client_last_active.pop(key, None)
+                _active_sse_queues.pop(key, None)
+                if client is not None:
+                    log.info("客户端空闲超时，主动回收释放底层进程资源: %s", key)
+                    try:
+                        await client.aclose()
+                    except Exception as e:
+                        log.warning("关闭空闲客户端 %s 时异常: %s", key, e)
         except asyncio.CancelledError:
             break
-        except Exception as exc:
-            log.error("空闲子进程清理任务异常: %s", exc)
+        except Exception as e:
+            log.warning("clean_idle_clients 任务异常: %s", e)
+
+
+def get_lock(client_key: str) -> asyncio.Lock:
+    if client_key not in _client_locks:
+        _client_locks[client_key] = asyncio.Lock()
+    return _client_locks[client_key]
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    cleanup_task = asyncio.create_task(_cleanup_idle_clients())
+async def lifespan(app: FastAPI):
+    # 启动时：初始化 SQLite 数据库及扩展
+    init_db()
+    ensure_extensions()
+    clean_task = asyncio.create_task(clean_idle_clients())
+    log.info("系统初始化完成，用户与工作区沙箱已就绪")
+    yield
+    # 关闭时：取消后台清理任务，并安全杀死所有底层 Node 子进程
+    clean_task.cancel()
     try:
-        yield
-    finally:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-        for client_id in list(_clients.keys()):
-            await close_client(client_id)
-        _clients.clear()
-        _client_locks.clear()
-        _client_last_active.clear()
-        _pending_confirms.clear()
-        _active_sse_queues.clear()
+        await clean_task
+    except asyncio.CancelledError:
+        pass
+
+    close_tasks = []
+    for client in _clients.values():
+        close_tasks.append(client.aclose())
+    if close_tasks:
+        await asyncio.gather(*close_tasks, return_exceptions=True)
+    _clients.clear()
+    _client_locks.clear()
+    _client_last_active.clear()
+    _pending_confirms.clear()
+    _active_sse_queues.clear()
 
 
 app = FastAPI(title="pi web chat", lifespan=lifespan)
@@ -226,7 +245,7 @@ app.add_middleware(
 
 
 class AuthMiddleware:
-    """局域网访问鉴权中间件，纯 ASGI 实现，零开销且完美支持 SSE 长流式。"""
+    """多用户 JWT 鉴权中间件，纯 ASGI 实现，零开销且完美支持 SSE 长流式。"""
 
     def __init__(self, app):
         self.app = app
@@ -236,12 +255,17 @@ class AuthMiddleware:
             return await self.app(scope, receive, send)
 
         path = scope.get("path", "")
-        # 放行 OPTIONS 预检请求以及非 API 路由
+        # 放行 OPTIONS 预检请求以及非 API 路由（如静态资源）
         if scope.get("method") == "OPTIONS" or not path.startswith("/api/"):
             return await self.app(scope, receive, send)
 
-        # 密码未配置时放行，或认证状态/校验接口放行
-        if not AUTH_TOKEN or path in ("/api/auth/status", "/api/auth/verify"):
+        # 公开接口放行：状态检查、登录、注册
+        public_paths = (
+            "/api/auth/status",
+            "/api/auth/login",
+            "/api/auth/register",
+        )
+        if path in public_paths:
             return await self.app(scope, receive, send)
 
         headers = dict(scope.get("headers", []))
@@ -252,9 +276,25 @@ class AuthMiddleware:
         elif b"x-auth-token" in headers:
             token = headers[b"x-auth-token"].decode("utf-8").strip()
 
-        if token != AUTH_TOKEN:
-            res = JSONResponse({"detail": "访问密码错误或未提供"}, status_code=401)
+        if not token:
+            res = JSONResponse({"detail": "未登录或缺少身份凭证，请先登录"}, status_code=401)
             return await res(scope, receive, send)
+
+        payload = decode_access_token(token)
+        if not payload or "sub" not in payload:
+            res = JSONResponse({"detail": "登录已过期或凭证无效，请重新登录"}, status_code=401)
+            return await res(scope, receive, send)
+
+        user = get_user_by_id(payload["sub"])
+        if not user:
+            res = JSONResponse({"detail": "用户不存在，请重新登录"}, status_code=401)
+            return await res(scope, receive, send)
+        if user.status != "active":
+            res = JSONResponse({"detail": "账号已被禁用，请联系管理员"}, status_code=403)
+            return await res(scope, receive, send)
+
+        # 将解析出的用户对象存入 ASGI scope state
+        scope.setdefault("state", {})["user"] = user
 
         return await self.app(scope, receive, send)
 
@@ -262,29 +302,18 @@ class AuthMiddleware:
 app.add_middleware(AuthMiddleware)
 
 
-class VerifyTokenRequest(BaseModel):
-    token: str
-
-
-class ChatRequest(BaseModel):
-    client_id: str
-    message: str
-
-
-class ConfirmActionRequest(BaseModel):
-    client_id: str
-    confirm_id: str
-    approved: bool
+class AuthRequest(BaseModel):
+    username: str
+    password: str
 
 
 class ClientRequest(BaseModel):
     client_id: str | None = None
 
 
-class ModelRequest(BaseModel):
+class ChatRequest(BaseModel):
     client_id: str
-    provider: str
-    model_id: str
+    message: str
 
 
 class SwitchRequest(BaseModel):
@@ -297,13 +326,29 @@ class DeleteSessionRequest(BaseModel):
     session_file: str
 
 
-def sse(payload: dict[str, Any]) -> str:
-    frame = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-    return clean_text(frame)
+class ModelRequest(BaseModel):
+    client_id: str
+    provider: str
+    model_id: str
 
 
-def make_ui_handler(client_id: str):
-    """为指定客户端构建交互式安全审核处理器，支持网页端人类在环手动确认。"""
+class ConfirmActionRequest(BaseModel):
+    client_id: str
+    confirm_id: str
+    approved: bool
+
+
+def clean_text(text: str) -> str:
+    """清理多余空行，保留段落结构。"""
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def sse(data: dict[str, Any]) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def make_ui_handler(client_key: str):
+    """为指定客户端连接构建交互式安全审核处理器，支持网页端人类在环手动确认。"""
 
     async def ui_handler(request: dict) -> object:
         method = request.get("method")
@@ -336,7 +381,7 @@ def make_ui_handler(client_id: str):
         future: asyncio.Future[bool] = loop.create_future()
         _pending_confirms[confirm_id] = future
 
-        queue = _active_sse_queues.get(client_id)
+        queue = _active_sse_queues.get(client_key)
         if queue is not None:
             await queue.put(
                 {
@@ -349,13 +394,23 @@ def make_ui_handler(client_id: str):
             )
 
         try:
-            log.info("等待用户在网页端手动确认 [%s]: %s", confirm_id, title or message)
-            # 等待用户在网页端点击，超时时间 120 秒
-            approved = await asyncio.wait_for(future, timeout=120.0)
+            log.info("等待用户在网页端手动确认 [%s] (client=%s): %s", confirm_id, client_key, title or message)
+            # 等待用户在网页端点击确认
+            approved = await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT)
             log.info("用户确认结果 [%s]: %s", confirm_id, "允许执行" if approved else "拒绝执行")
             return approved
         except (asyncio.TimeoutError, asyncio.CancelledError):
             log.warning("用户确认超时或取消 [%s]，默认拒绝执行", confirm_id)
+            if queue is not None:
+                try:
+                    await queue.put(
+                        {
+                            "type": "confirm_timeout",
+                            "confirm_id": confirm_id,
+                        }
+                    )
+                except Exception:
+                    pass
             return False
         finally:
             _pending_confirms.pop(confirm_id, None)
@@ -363,51 +418,114 @@ def make_ui_handler(client_id: str):
     return ui_handler
 
 
-def get_client_session_dir(client_id: str) -> Path:
-    """为每个 client_id 分配独立的会话存储目录，杜绝多端共享与并发写冲突。"""
-    safe_cid = re.sub(r"[^a-zA-Z0-9_\-]", "", client_id) or "default"
-    target = (PROJECT_DIR / ".pi" / "sessions" / safe_cid).resolve()
+# -------------------------------------------------------------
+# 多租户会话目录与私有工作区沙箱 (Phase 1 & Phase 2)
+# -------------------------------------------------------------
+
+def get_user_session_dir(user_id: str) -> Path:
+    """获取用户专属的会话存储目录（跨设备多端漫游与同步）。"""
+    safe_uid = re.sub(r"[^a-zA-Z0-9_\-]", "", user_id) or "default"
+    target = (PROJECT_DIR / ".pi" / "sessions" / safe_uid).resolve()
     target.mkdir(parents=True, exist_ok=True)
     return target
 
 
-def get_allowed_sessions_dir(client_id: str) -> Path:
-    """获取指定客户端合法受信任的专属会话目录。"""
-    return get_client_session_dir(client_id)
+def get_user_workspace_dir(user_id: str, username: str = "") -> Path:
+    """获取用户的工作区沙箱目录（Agent 执行命令、读写文件的工作目录）。"""
+    safe_uid = re.sub(r"[^a-zA-Z0-9_\-]", "", user_id) or "default"
+    if PI_WORKSPACE_DIR:
+        # 支持占位符 {user_id} 或 {username}
+        rendered = PI_WORKSPACE_DIR.replace("{user_id}", safe_uid)
+        safe_uname = re.sub(r"[^a-zA-Z0-9_\-]", "", username) if username else safe_uid
+        rendered = rendered.replace("{username}", safe_uname)
+        target = Path(rendered)
+        if not target.is_absolute():
+            target = (PROJECT_DIR / target).resolve()
+        else:
+            target = target.resolve()
+    else:
+        # 默认多租户沙箱隔离模式
+        target = (PROJECT_DIR / "workspaces" / safe_uid).resolve()
+
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
-async def get_client(client_id: str) -> AsyncPiClient:
-    """安全获取或创建客户端实例，带有双重检查锁防止并发竞态。"""
-    touch_client(client_id)
-    client = _clients.get(client_id)
+def get_client_key(user_id: str, client_id: str) -> str:
+    """将 user_id 与当前终端 client_id 联合编码作为活跃进程标识。"""
+    safe_cid = re.sub(r"[^a-zA-Z0-9_\-]", "", client_id) or "default"
+    return f"{user_id}_{safe_cid}"
+
+
+def get_user_and_key(request: Request, client_id: str) -> tuple[User, str]:
+    """从请求中提取已通过鉴权的用户对象及当前终端 Key。"""
+    user: User | None = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+    key = get_client_key(user.id, client_id)
+    return user, key
+
+
+def validate_session_path(session_file: str, allowed_dir: Path) -> Path:
+    """严格防路径穿越校验，确保只能访问当前用户所属的会话目录。"""
+    try:
+        resolved = Path(session_file).resolve()
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail="非法文件路径") from exc
+
+    try:
+        resolved.relative_to(allowed_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="禁止访问未授权的会话目录") from exc
+
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="会话文件不存在")
+    return resolved
+
+
+async def get_client(user_id: str, client_id: str) -> AsyncPiClient:
+    """安全获取或创建客户端实例，隔离工作区与独立会话目录。"""
+    key = get_client_key(user_id, client_id)
+    touch_client(key)
+    client = _clients.get(key)
     if client is not None:
         return client
 
     async with _creation_lock:
-        # 双重检查，避免排队中的并发协程重复拉起进程
-        client = _clients.get(client_id)
+        client = _clients.get(key)
         if client is not None:
             return client
 
-        session_dir = get_client_session_dir(client_id)
+        user = get_user_by_id(user_id)
+        uname = user.username if user else ""
+        session_dir = get_user_session_dir(user_id)
+        workspace_dir = get_user_workspace_dir(user_id, uname)
+        ext_script = PROJECT_DIR / "web" / "server" / "extensions" / "web_approval.js"
+
+        extra_args = ["--offline", "--approve"]
+        if ext_script.is_file():
+            extra_args.extend(["--extension", str(ext_script)])
+
         client = AsyncPiClient(
             executable=PI_EXECUTABLE,
-            cwd=str(PROJECT_DIR),
+            cwd=str(workspace_dir),
             session_dir=str(session_dir),
-            ui_handler=make_ui_handler(client_id),
+            ui_handler=make_ui_handler(key),
             limits=PI_LIMITS,
-            extra_args=["--offline", "--approve"],
+            extra_args=extra_args,
         )
         await client.start()
-        _clients[client_id] = client
-        if client_id not in _client_locks:
-            _client_locks[client_id] = asyncio.Lock()
-        touch_client(client_id)
+        _clients[key] = client
+        if key not in _client_locks:
+            _client_locks[key] = asyncio.Lock()
+        touch_client(key)
         state = await client.get_state()
         model = state.get("model") or {}
         log.info(
-            "client %s started (session_dir=%s): %s/%s",
-            client_id,
+            "client %s started (user=%s, workspace=%s, session_dir=%s): %s/%s",
+            key,
+            user_id,
+            workspace_dir,
             session_dir,
             model.get("provider"),
             model.get("id"),
@@ -415,90 +533,90 @@ async def get_client(client_id: str) -> AsyncPiClient:
         return client
 
 
-def get_lock(client_id: str) -> asyncio.Lock:
-    lock = _client_locks.get(client_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _client_locks[client_id] = lock
-    return lock
-
-
-def validate_session_path(session_path: str, allowed_dir: Path) -> Path:
-    """严格校验会话路径，防止跨目录路径遍历与任意文件读写删除。"""
-    try:
-        target = Path(session_path).resolve()
-    except Exception:
-        raise HTTPException(status_code=400, detail="非法路径格式")
-
-    if target.suffix.lower() != ".jsonl":
-        raise HTTPException(status_code=400, detail="非法会话文件格式: 仅支持 .jsonl")
-
-    # 目录沙箱校验 (禁止跨目录越权访问)
-    try:
-        target.relative_to(allowed_dir)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="禁止跨目录越权访问会话文件")
-
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail="会话文件不存在")
-
-    return target
-
-
-def event_payload(event: Event) -> dict[str, Any] | None:
-    if event.text_delta:
-        return {"type": "text", "delta": event.text_delta}
-
-    if event.type == "message_update":
-        nested = event.raw.get("assistantMessageEvent") or {}
-        kind = nested.get("type")
-        if kind == "thinking_delta":
-            return {"type": "thinking", "delta": nested.get("delta", "")}
-        if kind == "toolcall_start":
-            return {"type": "tool_start", "name": nested.get("toolName")}
-        return None
-
-    if event.type == "tool_execution_start":
-        return {
-            "type": "tool_exec",
-            "name": event.raw.get("toolName"),
-            "args": event.raw.get("args"),
-        }
-    if event.type == "tool_execution_end":
-        result = event.raw.get("result")
-        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-        return {
-            "type": "tool_end",
-            "name": event.raw.get("toolName"),
-            "ok": not event.raw.get("isError"),
-            "result": text[:TOOL_RESULT_MAX],
-        }
-    return None
-
+# -------------------------------------------------------------
+# 身份认证 API
+# -------------------------------------------------------------
 
 @app.get("/api/auth/status")
 async def auth_status() -> dict[str, Any]:
-    """检查当前服务是否启用了访问密码保护及客户端持久化模式。"""
+    """检查系统认证模式、是否已有注册用户以及保持模式。"""
     return {
-        "auth_required": bool(AUTH_TOKEN),
+        "auth_mode": "user",
+        "auth_required": True,
+        "has_users": count_users() > 0,
         "auth_remember": AUTH_REMEMBER,
     }
 
 
-@app.post("/api/auth/verify")
-async def auth_verify(req: VerifyTokenRequest) -> dict[str, bool]:
-    """验证用户输入的访问密码。"""
-    if not AUTH_TOKEN:
-        return {"ok": True}
-    if req.token.strip() == AUTH_TOKEN:
-        return {"ok": True}
-    raise HTTPException(status_code=401, detail="访问密码错误")
+@app.post("/api/auth/register")
+async def register_endpoint(req: AuthRequest) -> dict[str, Any]:
+    """用户注册。首位注册者自动成为管理员。"""
+    username = req.username.strip()
+    if len(username) < 3 or len(username) > 32:
+        raise HTTPException(status_code=400, detail="用户名长度需在 3 到 32 个字符之间")
+    if not re.match(r"^[a-zA-Z0-9_\-\u4e00-\u9fa5]+$", username):
+        raise HTTPException(status_code=400, detail="用户名仅支持中英文字符、数字与下划线")
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="密码长度不能少于 6 位")
 
+    if get_user_by_username(username) is not None:
+        raise HTTPException(status_code=409, detail="该用户名已被注册")
+
+    pw_hash = hash_password(req.password)
+    user = create_user(username, pw_hash)
+    token = create_access_token(user)
+    record_audit(user.id, "register", f"新用户注册: {user.username} (角色: {user.role})")
+    return {
+        "token": token,
+        "user": user.to_dict(),
+    }
+
+
+@app.post("/api/auth/login")
+async def login_endpoint(req: AuthRequest) -> dict[str, Any]:
+    """用户登录并签发 JWT 访问令牌。"""
+    username = req.username.strip()
+    user = get_user_by_username(username)
+    if user is None or not verify_password(req.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    if user.status != "active":
+        raise HTTPException(status_code=403, detail="该账号已被禁用，请联系管理员")
+
+    token = create_access_token(user)
+    record_audit(user.id, "login", f"用户登录: {user.username}")
+    return {
+        "token": token,
+        "user": user.to_dict(),
+    }
+
+
+@app.get("/api/auth/me")
+async def get_me_endpoint(request: Request) -> dict[str, Any]:
+    """获取当前已登录用户的详情。"""
+    user: User | None = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="未登录或登录已失效")
+    return {"user": user.to_dict()}
+
+
+@app.post("/api/auth/logout")
+async def logout_endpoint(request: Request) -> dict[str, Any]:
+    """退出登录并记录审计日志。"""
+    user: User | None = getattr(request.state, "user", None)
+    if user:
+        record_audit(user.id, "logout", f"用户退出登录: {user.username}")
+    return {"ok": True}
+
+
+# -------------------------------------------------------------
+# 业务 API
+# -------------------------------------------------------------
 
 @app.post("/api/confirm")
-async def confirm_action_endpoint(req: ConfirmActionRequest) -> dict[str, bool]:
+async def confirm_action_endpoint(req: ConfirmActionRequest, request: Request) -> dict[str, Any]:
     """接收用户在网页端对工具执行的手动确认结果。"""
-    touch_client(req.client_id)
+    user, key = get_user_and_key(request, req.client_id)
+    touch_client(key)
     future = _pending_confirms.get(req.confirm_id)
     if future and not future.done():
         future.set_result(req.approved)
@@ -506,7 +624,7 @@ async def confirm_action_endpoint(req: ConfirmActionRequest) -> dict[str, bool]:
             # 用户选择【拒绝】，主动中止当前任务，停止后续工具与回复生成
             async def trigger_abort():
                 await asyncio.sleep(0.05)
-                client = _clients.get(req.client_id)
+                client = _clients.get(key)
                 if client is not None:
                     try:
                         await client.abort()
@@ -515,14 +633,19 @@ async def confirm_action_endpoint(req: ConfirmActionRequest) -> dict[str, bool]:
 
             asyncio.create_task(trigger_abort())
         return {"ok": True}
-    return {"ok": False}
+    return {"ok": False, "expired": True}
 
 
 @app.post("/api/session")
-async def create_session(req: ClientRequest) -> dict[str, Any]:
+async def create_session(req: ClientRequest, request: Request) -> dict[str, Any]:
+    """创建或恢复客户端会话，自动归属至当前用户目录。"""
+    user: User | None = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+
     client_id = req.client_id or uuid.uuid4().hex
     try:
-        client = await get_client(client_id)
+        client = await get_client(user.id, client_id)
         state = await client.get_state()
     except PiError as exc:
         raise HTTPException(status_code=500, detail=f"启动 pi 失败: {exc}") from exc
@@ -531,34 +654,110 @@ async def create_session(req: ClientRequest) -> dict[str, Any]:
         "client_id": client_id,
         "model": f"{model.get('provider')}/{model.get('id')}",
         "session_id": state.get("sessionId"),
+        "user": user.to_dict(),
     }
 
 
 @app.post("/api/session/close")
-async def close_session_endpoint(req: ClientRequest) -> dict[str, bool]:
-    """主动注销客户端会话并销毁后台子进程。"""
-    if req.client_id:
-        await close_client(req.client_id)
-    return {"ok": True}
+async def close_session(req: ClientRequest, request: Request) -> dict[str, bool]:
+    user, key = get_user_and_key(request, req.client_id or "")
+    client = _clients.pop(key, None)
+    _client_locks.pop(key, None)
+    _client_last_active.pop(key, None)
+    _active_sse_queues.pop(key, None)
+    if client is not None:
+        log.info("用户主动注销客户端实例: %s", key)
+        await client.aclose()
+        return {"ok": True}
+    return {"ok": False}
+
+
+def event_payload(event: Event) -> dict[str, Any] | None:
+    t = event.type
+    raw = getattr(event, "raw", {}) or {}
+
+    # 1. 核心协议：message_update (包含 text_delta / thinking_delta)
+    if t == "message_update":
+        sub = raw.get("assistantMessageEvent")
+        if isinstance(sub, dict):
+            st = sub.get("type")
+            if st == "text_delta":
+                return {"type": "text", "delta": sub.get("delta", "")}
+            elif st == "thinking_delta":
+                return {"type": "thinking", "delta": sub.get("delta", "")}
+
+    # 兼容扁平分发模式
+    if t == "text_delta":
+        delta = getattr(event, "delta", None) or raw.get("delta", "")
+        return {"type": "text", "delta": delta}
+    if t == "thinking_delta":
+        delta = getattr(event, "delta", None) or raw.get("delta", "")
+        return {"type": "thinking", "delta": delta}
+
+    # 2. 工具开始执行事件
+    if t in ("tool_execution_start", "tool_call_start"):
+        tool_name = raw.get("toolName") or getattr(event, "tool_name", None)
+        return {"type": "tool_start", "name": tool_name}
+
+    # 3. 工具执行更新事件 (包含参数等)
+    if t in ("tool_execution_update", "tool_call_update"):
+        tool_name = raw.get("toolName") or getattr(event, "tool_name", None)
+        args = raw.get("args") if "args" in raw else getattr(event, "arguments", None)
+        return {"type": "tool_exec", "name": tool_name, "args": args}
+
+    # 4. 工具执行完成事件
+    if t in ("tool_execution_end", "tool_call_end"):
+        tool_name = raw.get("toolName") or getattr(event, "tool_name", None)
+        is_error = raw.get("isError") if "isError" in raw else getattr(event, "is_error", False)
+        res = raw.get("result") if "result" in raw else getattr(event, "result", None)
+
+        text = ""
+        if hasattr(res, "content"):
+            content = getattr(res, "content")
+        elif isinstance(res, dict):
+            content = res.get("content")
+        else:
+            content = None
+
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    text += b.get("text", "")
+                elif hasattr(b, "type") and getattr(b, "type") == "text":
+                    text += getattr(b, "text", "")
+        elif isinstance(content, str):
+            text = content
+        elif isinstance(res, str):
+            text = res
+        elif res is not None:
+            try:
+                text = json.dumps(res, ensure_ascii=False)
+            except Exception:
+                text = str(res)
+
+        return {
+            "type": "tool_end",
+            "name": tool_name,
+            "ok": not bool(is_error),
+            "result": text[:TOOL_RESULT_MAX],
+        }
+
+    return None
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest) -> StreamingResponse:
-    if not req.message.strip():
-        raise HTTPException(status_code=400, detail="消息不能为空")
-    try:
-        client = await get_client(req.client_id)
-    except PiError as exc:
-        raise HTTPException(status_code=500, detail=f"pi 不可用: {exc}") from exc
-
-    touch_client(req.client_id)
-    lock = get_lock(req.client_id)
+async def chat(req: ChatRequest, request: Request):
+    user, key = get_user_and_key(request, req.client_id)
+    client = await get_client(user.id, req.client_id)
+    lock = get_lock(key)
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="上一轮回答尚未结束")
 
     async def generate():
         async with lock:
-            touch_client(req.client_id)
+            touch_client(key)
             queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-            _active_sse_queues[req.client_id] = queue
+            _active_sse_queues[key] = queue
 
             async def drive_stream():
                 try:
@@ -602,7 +801,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                     elif item_type == "__RUN_RESULT__":
                         result = item["result"]
                         usage = result.usage
-                        touch_client(req.client_id)
+                        touch_client(key)
                         yield sse(
                             {
                                 "type": "done",
@@ -624,29 +823,26 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                         # 正常流事件（text, thinking, tool, confirm_request 等）
                         yield sse(item)
             finally:
-                _active_sse_queues.pop(req.client_id, None)
+                _active_sse_queues.pop(key, None)
                 if not drive_task.done():
                     drive_task.cancel()
 
     return StreamingResponse(
         generate(),
-        media_type="text/event-stream; charset=utf-8",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
-def clean_text(text: str) -> str:
-    """去掉孤立代理字符, 避免 JSON 序列化失败 (历史脏数据兜底)。"""
-    return text.encode("utf-8", "replace").decode("utf-8")
-
-
 def session_title(path: Path) -> str:
-    """从 session jsonl 提取首条用户消息作为标题。"""
+    """提取首条用户消息前 40 字作为会话展示标题。"""
     try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            for _ in range(30):
-                line = fh.readline()
-                if not line:
+        with path.open(encoding="utf-8") as f:
+            for line_idx, line in enumerate(f):
+                if line_idx > 40:
                     break
                 try:
                     entry = json.loads(line)
@@ -781,12 +977,12 @@ def to_ui_messages(raw: list[Any]) -> list[dict[str, Any]]:
 
 
 @app.post("/api/interrupt")
-async def interrupt(req: ClientRequest) -> dict[str, bool]:
-    cid = req.client_id or ""
-    client = _clients.get(cid)
+async def interrupt(req: ClientRequest, request: Request) -> dict[str, bool]:
+    user, key = get_user_and_key(request, req.client_id or "")
+    client = _clients.get(key)
     if client is None:
         raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(cid)
+    touch_client(key)
     try:
         await client.abort()
     except PiError as exc:
@@ -795,13 +991,11 @@ async def interrupt(req: ClientRequest) -> dict[str, bool]:
 
 
 @app.post("/api/new")
-async def new_session(req: ClientRequest) -> dict[str, Any]:
-    cid = req.client_id or ""
-    client = _clients.get(cid)
-    if client is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(cid)
-    lock = get_lock(cid)
+async def new_session(req: ClientRequest, request: Request) -> dict[str, Any]:
+    user, key = get_user_and_key(request, req.client_id or "")
+    client = await get_client(user.id, req.client_id or "")
+    touch_client(key)
+    lock = get_lock(key)
     if lock.locked():
         raise HTTPException(status_code=409, detail="回答进行中, 请先停止")
     await client.new_session()
@@ -814,14 +1008,12 @@ async def new_session(req: ClientRequest) -> dict[str, Any]:
 
 
 @app.post("/api/fork")
-async def fork_endpoint(req: ClientRequest) -> dict[str, Any]:
+async def fork_endpoint(req: ClientRequest, request: Request) -> dict[str, Any]:
     """通过 pi 原生 fork 分叉，将当前会话切到上一条用户消息处，避免重新生成污染会话。"""
-    cid = req.client_id or ""
-    client = _clients.get(cid)
-    if client is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(cid)
-    lock = get_lock(cid)
+    user, key = get_user_and_key(request, req.client_id or "")
+    client = await get_client(user.id, req.client_id or "")
+    touch_client(key)
+    lock = get_lock(key)
     if lock.locked():
         raise HTTPException(status_code=409, detail="回答进行中, 请先停止")
 
@@ -848,16 +1040,19 @@ async def fork_endpoint(req: ClientRequest) -> dict[str, Any]:
 
 
 @app.get("/api/stats")
-async def stats(client_id: str) -> dict[str, Any]:
-    client = _clients.get(client_id)
-    if client is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(client_id)
+async def stats(client_id: str, request: Request) -> dict[str, Any]:
+    user, key = get_user_and_key(request, client_id)
+    client = await get_client(user.id, client_id)
+    touch_client(key)
     return await client.get_session_stats()
 
 
 @app.get("/api/models")
-async def models() -> list[dict[str, Any]]:
+async def models(request: Request) -> list[dict[str, Any]]:
+    user: User | None = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+
     for client in _clients.values():
         try:
             available = await client.get_available_models()
@@ -867,15 +1062,21 @@ async def models() -> list[dict[str, Any]]:
             ]
         except PiError:
             continue
-    raise HTTPException(status_code=409, detail="没有可用客户端")
+
+    # 如果当前没有任何客户端在运行，临时拉起一个探针检查可用模型
+    temp_client = await get_client(user.id, "probe")
+    available = await temp_client.get_available_models()
+    return [
+        {"id": m.get("id"), "name": m.get("name"), "provider": m.get("provider")}
+        for m in available
+    ]
 
 
 @app.post("/api/model")
-async def set_model(req: ModelRequest) -> dict[str, Any]:
-    client = _clients.get(req.client_id)
-    if client is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(req.client_id)
+async def set_model(req: ModelRequest, request: Request) -> dict[str, Any]:
+    user, key = get_user_and_key(request, req.client_id)
+    client = await get_client(user.id, req.client_id)
+    touch_client(key)
     try:
         model = await client.set_model(req.provider, req.model_id)
     except PiError as exc:
@@ -884,16 +1085,15 @@ async def set_model(req: ModelRequest) -> dict[str, Any]:
 
 
 @app.get("/api/history")
-async def history(client_id: str) -> dict[str, Any]:
-    """当前客户端独立存储目录下的历史会话列表 (按修改时间倒序)。"""
-    client = _clients.get(client_id)
-    if client is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(client_id)
+async def history(client_id: str, request: Request) -> dict[str, Any]:
+    """当前用户独立存储目录下的历史会话列表 (支持跨设备多端漫游)。"""
+    user, key = get_user_and_key(request, client_id)
+    client = await get_client(user.id, client_id)
+    touch_client(key)
     state = await client.get_state()
     current = state.get("sessionFile")
 
-    folder = get_client_session_dir(client_id)
+    folder = get_user_session_dir(user.id)
     items: list[dict[str, Any]] = []
     if folder.is_dir():
         for path in folder.glob("*.jsonl"):
@@ -911,11 +1111,10 @@ async def history(client_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/messages")
-async def get_messages_endpoint(client_id: str) -> dict[str, Any]:
-    client = _clients.get(client_id)
-    if client is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(client_id)
+async def get_messages_endpoint(client_id: str, request: Request) -> dict[str, Any]:
+    user, key = get_user_and_key(request, client_id)
+    client = await get_client(user.id, client_id)
+    touch_client(key)
     raw = await client.get_messages()
     state = await client.get_state()
     return {
@@ -926,17 +1125,16 @@ async def get_messages_endpoint(client_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/switch")
-async def switch_session_endpoint(req: SwitchRequest) -> dict[str, Any]:
-    client = _clients.get(req.client_id)
-    if client is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(req.client_id)
-    lock = get_lock(req.client_id)
+async def switch_session_endpoint(req: SwitchRequest, request: Request) -> dict[str, Any]:
+    user, key = get_user_and_key(request, req.client_id)
+    client = await get_client(user.id, req.client_id)
+    touch_client(key)
+    lock = get_lock(key)
     if lock.locked():
         raise HTTPException(status_code=409, detail="回答进行中, 请先停止")
 
-    # 路径严格沙箱校验：必须在当前 client 的专属 session_dir 内
-    allowed_dir = get_allowed_sessions_dir(req.client_id)
+    # 路径严格沙箱校验：必须在当前用户专属 session_dir 内
+    allowed_dir = get_user_session_dir(user.id)
     target = validate_session_path(req.session_file, allowed_dir)
 
     try:
@@ -956,17 +1154,16 @@ async def switch_session_endpoint(req: SwitchRequest) -> dict[str, Any]:
 
 
 @app.post("/api/history/delete")
-async def delete_session_endpoint(req: DeleteSessionRequest) -> dict[str, Any]:
-    client = _clients.get(req.client_id)
-    if client is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    touch_client(req.client_id)
-    lock = get_lock(req.client_id)
+async def delete_session_endpoint(req: DeleteSessionRequest, request: Request) -> dict[str, Any]:
+    user, key = get_user_and_key(request, req.client_id)
+    client = await get_client(user.id, req.client_id)
+    touch_client(key)
+    lock = get_lock(key)
     if lock.locked():
         raise HTTPException(status_code=409, detail="回答进行中, 请先停止")
 
-    # 路径严格沙箱校验：必须在当前 client 的专属 session_dir 内
-    allowed_dir = get_allowed_sessions_dir(req.client_id)
+    # 路径严格沙箱校验：必须在当前用户专属 session_dir 内
+    allowed_dir = get_user_session_dir(user.id)
     target = validate_session_path(req.session_file, allowed_dir)
 
     state = await client.get_state()

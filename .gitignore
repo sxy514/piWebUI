@@ -29,3 +29,6 @@ npm-debug.log*
 # pi 运行时临时数据与会话文件（忽略会话数据，但保留项目内置扩展）
 .pi/*
 !.pi/extensions/
+
+# 多租户私有工作区（隔离存储用户的代码与文件）
+workspaces/

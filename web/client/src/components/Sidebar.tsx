@@ -1,7 +1,7 @@
-import { Bot, Plus, Trash2 } from 'lucide-react'
+import { Bot, LogOut, Plus, Trash2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Spinner } from '@/components/ui/spinner'
-import type { HistoryItem } from '@/lib/api'
+import type { HistoryItem, UserInfo } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 interface SidebarProps {
@@ -10,6 +10,8 @@ interface SidebarProps {
   history: HistoryItem[]
   model: string
   busy: boolean
+  currentUser?: UserInfo | null
+  onLogout?: () => void
   onNewChat: () => void
   onSelect: (file: string) => void
   onDelete: (file: string) => void
@@ -33,6 +35,8 @@ export function Sidebar({
   history,
   model,
   busy,
+  currentUser,
+  onLogout,
   onNewChat,
   onSelect,
   onDelete,
@@ -144,8 +148,35 @@ export function Sidebar({
           ))}
         </nav>
 
-        {/* 底部模型信息 */}
-        <div className="border-t border-white/8 px-4 py-3">
+        {/* 底部用户信息与模型 */}
+        <div className="border-t border-white/8 px-4 py-3 space-y-2.5">
+          {currentUser && (
+            <div className="flex items-center justify-between gap-2 rounded-xl bg-white/5 px-2.5 py-2 text-xs">
+              <div className="flex min-w-0 items-center gap-2">
+                <div className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-primary/15 text-primary text-xs font-bold">
+                  {currentUser.username[0]?.toUpperCase() || 'U'}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-medium text-foreground">
+                    {currentUser.username}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">
+                    {currentUser.role === 'admin' ? '系统管理员' : '普通用户'}
+                  </div>
+                </div>
+              </div>
+              {onLogout && (
+                <button
+                  type="button"
+                  onClick={onLogout}
+                  title="退出登录"
+                  className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-muted-foreground transition hover:bg-destructive/15 hover:text-destructive"
+                >
+                  <LogOut className="size-3.5" />
+                </button>
+              )}
+            </div>
+          )}
           <div className="flex items-center justify-between gap-2">
             <Badge
               variant="secondary"

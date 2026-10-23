@@ -133,9 +133,15 @@ npm run test:md           # Markdown 渲染管线测试（GFM/高亮/KaTeX/merma
 - **断点无缝恢复**：前端本地持久化 `client_id` 与会话状态，移动端切后台休眠或页面刷新后秒级恢复历史对话，避免空白重建。
 
 ### 🛡️ 安全与高可用加固
-1. **轻量密码保护**：
-   - 纯 ASGI 原生鉴权中间件，零性能开销，且完美兼容 SSE 长连接推流；
-   - 首次进入弹窗验证，成功后存入浏览器 `localStorage`，一次输入、长期免密。
+1. **多用户体系与 JWT 鉴权 (Phase 1)**：
+   - 基于原生 SQLite (`.pi/piweb.db`) 与标准 JWT，支持多账号登录与注册；
+   - 首次启动系统，注册的首位用户自动获得超级管理员（`admin`）权限；
+   - 密码采用 PBKDF2-HMAC-SHA256 加盐安全散列（10万次迭代，防彩虹表）；
+   - 纯 ASGI 原生中间件鉴权，零性能开销，完美兼容 SSE 长流式连接；
+   - **跨设备会话云同步**：会话按 `user_id` 归属隔离，手机与电脑登录同一账号即可多端漫游历史对话。
+2. **多租户私有工作区沙箱 (Phase 2)**：
+   - 每个用户分配物理隔离的私有工作目录（`workspaces/<user_id>/`）；
+   - AI Agent 执行终端命令、创建和读写文件，均强制限制在当前用户的私有工作区内，彻底杜绝不同用户之间文件读取或误删的风险。
 2. **CORS 跨域安全收紧**：
    - 移除危险的 `*` 全放通，采用私有局域网网段正则白名单；
    - 坚决阻断外网恶意网页探测、利用浏览器当跳板偷袭本地 8000 端口。
@@ -157,8 +163,11 @@ npm run test:md           # Markdown 渲染管线测试（GFM/高亮/KaTeX/merma
 
 | 方法 | 路径 | 鉴权保护 | 说明 |
 | :--- | :--- | :---: | :--- |
-| GET  | `/api/auth/status` | 否 | 获取当前服务是否启用了访问密码保护 |
-| POST | `/api/auth/verify` | 否 | 验证用户输入的访问密码 |
+| GET  | `/api/auth/status` | 否 | 获取认证状态与是否已有注册用户 |
+| POST | `/api/auth/register` | 否 | 用户注册（首位注册者自动成为管理员） |
+| POST | `/api/auth/login` | 否 | 用户登录并签发 JWT 令牌 |
+| GET  | `/api/auth/me` | 是 | 获取当前登录用户的详情 |
+| POST | `/api/auth/logout` | 是 | 退出当前登录 |
 | POST | `/api/session` | 是 | 创建/恢复客户端会话 |
 | POST | `/api/session/close` | 是 | 主动注销并释放客户端子进程资源 |
 | POST | `/api/chat` | 是 | SSE 流式对话（text/thinking/tool/confirm_request/done/error） |

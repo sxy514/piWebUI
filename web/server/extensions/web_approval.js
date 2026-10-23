@@ -14,7 +14,7 @@ export default function (pi) {
     const input = event.input || {};
 
     let summary = "";
-    if (toolName === "bash") {
+    if (toolName === "bash" || toolName === "powershell") {
       summary = input.command || JSON.stringify(input);
     } else if (toolName === "write_file" || toolName === "edit_file") {
       const p = input.path || "";

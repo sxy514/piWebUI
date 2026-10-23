@@ -18,7 +18,7 @@ export type Part =
       confirm_id: string
       title: string
       message: string
-      status: 'pending' | 'approved' | 'denied'
+      status: 'pending' | 'approved' | 'denied' | 'expired'
       is_dangerous?: boolean
     }
 
@@ -29,10 +29,19 @@ export interface UsageInfo {
   cost?: number | null
 }
 
+export interface UserInfo {
+  id: string
+  username: string
+  role: string
+  status: string
+  created_at: number
+}
+
 export interface SessionInfo {
   client_id: string
   model: string
   session_id: string | null
+  user?: UserInfo
 }
 
 export interface HistoryItem {
@@ -75,6 +84,7 @@ export type StreamEvent =
       is_dangerous?: boolean
     }
   | { type: 'interrupted' }
+  | { type: 'confirm_timeout'; confirm_id: string }
   | { type: 'error'; message: string }
 
 let authToken = ''
@@ -118,7 +128,12 @@ export function getAuthToken(): string {
   return authToken
 }
 
-export async function getAuthStatus(): Promise<{ auth_required: boolean; auth_remember?: string }> {
+export async function getAuthStatus(): Promise<{
+  auth_mode: string
+  auth_required: boolean
+  has_users: boolean
+  auth_remember?: string
+}> {
   try {
     const res = await fetch('/api/auth/status')
     if (res.ok) {
@@ -127,19 +142,62 @@ export async function getAuthStatus(): Promise<{ auth_required: boolean; auth_re
   } catch {
     /* ignore network error */
   }
-  return { auth_required: false }
+  return { auth_mode: 'user', auth_required: true, has_users: false }
 }
 
-export async function verifyAuthToken(token: string): Promise<boolean> {
-  const res = await fetch('/api/auth/verify', {
+export async function loginUser(username: string, password: string): Promise<UserInfo> {
+  const res = await fetch('/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token }),
+    body: JSON.stringify({ username, password }),
   })
-  if (res.ok) {
-    setAuthToken(token, authRememberMode)
-    return true
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || '登录失败，请检查用户名与密码')
   }
+  const data = await res.json()
+  setAuthToken(data.token, authRememberMode)
+  return data.user
+}
+
+export async function registerUser(username: string, password: string): Promise<UserInfo> {
+  const res = await fetch('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || '注册失败')
+  }
+  const data = await res.json()
+  setAuthToken(data.token, authRememberMode)
+  return data.user
+}
+
+export async function getMe(): Promise<UserInfo | null> {
+  try {
+    const res = await authFetch('/api/auth/me')
+    if (res.ok) {
+      const data = await res.json()
+      return data.user
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+export async function logoutUser(): Promise<void> {
+  try {
+    await authFetch('/api/auth/logout', { method: 'POST' })
+  } catch {
+    /* ignore */
+  }
+  setAuthToken('')
+}
+
+export async function verifyAuthToken(_token: string): Promise<boolean> {
   return false
 }
 
@@ -249,7 +307,7 @@ export function sendConfirm(
   clientId: string,
   confirmId: string,
   approved: boolean,
-): Promise<{ ok: boolean }> {
+): Promise<{ ok: boolean; expired?: boolean }> {
   return postJson('/api/confirm', {
     client_id: clientId,
     confirm_id: confirmId,

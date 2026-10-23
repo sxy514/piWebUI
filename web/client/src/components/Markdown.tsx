@@ -15,7 +15,7 @@ async function loadMermaid() {
     mermaidInstance = mod.default
     mermaidInstance.initialize({
       startOnLoad: false,
-      securityLevel: 'loose',
+      securityLevel: 'strict',
       theme: 'dark',
       fontFamily: 'inherit',
     })

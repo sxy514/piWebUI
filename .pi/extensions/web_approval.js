@@ -1,6 +1,7 @@
 export default function (pi) {
   pi.on("tool_call", async (event, ctx) => {
     const policy = (process.env.PI_AUTO_APPROVE_POLICY || "safe").toLowerCase();
+    // 1. 全自动模式：直接放行
     if (policy === "allow_all") {
       return;
     }
@@ -13,7 +14,7 @@ export default function (pi) {
     const input = event.input || {};
 
     let summary = "";
-    if (toolName === "bash") {
+    if (toolName === "bash" || toolName === "powershell") {
       summary = input.command || JSON.stringify(input);
     } else if (toolName === "write_file" || toolName === "edit_file") {
       const p = input.path || "";
@@ -43,3 +44,4 @@ export default function (pi) {
     }
   });
 }
+
