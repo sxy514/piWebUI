@@ -7,6 +7,7 @@ import { Sidebar } from '@/components/Sidebar'
 import { ThemeMenu } from '@/components/ThemeMenu'
 import { Spinner } from '@/components/ui/spinner'
 import { AuthModal } from '@/components/AuthModal'
+import { WorkspaceDrawer } from '@/components/WorkspaceDrawer'
 import { SessionUsage, formatTokens, type SessionStats } from '@/components/SessionUsage'
 import {
   createSession,
@@ -35,7 +36,7 @@ import {
   type ContextUsageInfo,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { CircleAlert, LogOut, Menu, Plus, User as UserIcon } from 'lucide-react'
+import { CircleAlert, LogOut, Menu, Plus, User as UserIcon, FolderArchive } from 'lucide-react'
 
 let msgSeq = 0
 const newId = () => `m${++msgSeq}`
@@ -48,6 +49,7 @@ export default function App() {
   const [streaming, setStreaming] = useState(false)
   const [history, setHistory] = useState<HistoryItem[]>([])
   const [models, setModels] = useState<ModelItem[]>([])
+  const [workspaceDrawerOpen, setWorkspaceDrawerOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [switching, setSwitching] = useState(false)
   const [needAuth, setNeedAuth] = useState(false)
@@ -670,6 +672,15 @@ export default function App() {
                 {streaming ? '生成中' : '就绪'}
               </span>
               <SessionUsage stats={sessionStats} />
+              <button
+                type="button"
+                onClick={() => setWorkspaceDrawerOpen(true)}
+                className="group flex cursor-pointer items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-muted-foreground transition hover:border-primary/40 hover:bg-white/10 hover:text-foreground"
+                title="查看与下载工作区生成的文件"
+              >
+                <FolderArchive className="size-3.5 text-primary group-hover:scale-110 transition-transform" />
+                <span className="hidden sm:inline font-medium text-foreground/90">成果文件</span>
+              </button>
               {currentUser && (
                 <div className="hidden items-center gap-1.5 rounded-full border border-white/10 bg-white/6 px-2.5 py-1 text-xs sm:flex">
                   <UserIcon className="size-3.5 text-primary" />
@@ -764,6 +775,11 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      <WorkspaceDrawer
+        open={workspaceDrawerOpen}
+        onClose={() => setWorkspaceDrawerOpen(false)}
+      />
 
       {needAuth && (
         <AuthModal

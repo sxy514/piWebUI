@@ -20,15 +20,19 @@ export default function (pi) {
       };
     }
 
-    // 严禁访问其他租户的工作区目录 (workspaces/<other_user_id>)
+    // 严禁探测多租户父目录 (workspaces) 或访问其他租户的工作区
     const currentWorkspaceName = path.basename(cwd);
-    const OTHER_WORKSPACE_REGEX = /[\\/]workspaces[\\/]([a-zA-Z0-9_\-]+)/i;
-    const wsMatch = payloadStr.match(OTHER_WORKSPACE_REGEX);
-    if (wsMatch && wsMatch[1] && wsMatch[1] !== currentWorkspaceName) {
-      return {
-        block: true,
-        reason: `[沙箱安全阻断] 严禁跨租户越权访问其他用户的工作区目录 [${wsMatch[1]}]`,
-      };
+    if (/workspaces/i.test(payloadStr)) {
+      const wsMatches = [...payloadStr.matchAll(/workspaces(?:[\\/]([a-zA-Z0-9_\-]+))?/gi)];
+      for (const m of wsMatches) {
+        const targetSub = m[1];
+        if (!targetSub || targetSub.toLowerCase() !== currentWorkspaceName.toLowerCase()) {
+          return {
+            block: true,
+            reason: `[沙箱安全阻断] 严禁探测多租户父目录或跨租户访问其他工作区 [${targetSub || "workspaces"}]`,
+          };
+        }
+      }
     }
 
     // =========================================================
@@ -81,14 +85,28 @@ export default function (pi) {
     // =========================================================
     // 🛡️ 核心防线 4：终端命令（powershell / bash / cmd）越界遍历拦截
     // =========================================================
+    // 🛡️ 核心防线 4：终端命令（powershell / bash / cmd）越界遍历拦截
+    // =========================================================
     if (toolName === "bash" || toolName === "powershell" || toolName === "cmd") {
       const cmd = String(input.command || "");
-      // 检查是否试图全局扫描根驱动器或项目根目录
-      const OUT_OF_BOUNDS_SCAN = /\b(?:Get-ChildItem|dir|ls|find)\b.*-[Pp]ath\s+['\"][A-Za-z]:[\\\/]?(?:piWebUI)?['\"]/i;
-      if (OUT_OF_BOUNDS_SCAN.test(cmd)) {
+
+      // 1. 严禁使用 .. 向上逃逸工作区
+      if (/(?:\.\.[\\/]|\.\.$|\.\.["'\s]|\bcd\s+\.\.)/i.test(cmd)) {
         return {
           block: true,
-          reason: `[沙箱安全阻断] 严禁在宿主机根目录或项目根路径进行全局遍历扫描，命令限定在当前工作区内执行`,
+          reason: `[沙箱安全阻断] 严禁使用相对路径 '..' 向上越界逃逸当前工作区`,
+        };
+      }
+
+      // 2. 严禁扫描根目录、工程根目录或多租户根目录
+      if (
+        /\b(?:Get-ChildItem|dir|ls|find|tree)\b.*(?:-[Pp]ath\s+)?['"]?[A-Za-z]:[\\\/]?(?:piWebUI)?(?:["'\s]|$)/i.test(cmd) ||
+        /\b(?:Get-ChildItem|dir|ls|find|tree)\b.*['"][A-Za-z]:/i.test(cmd) ||
+        /\b(?:Get-ChildItem|dir|ls|find|tree)\b.*workspaces/i.test(cmd)
+      ) {
+        return {
+          block: true,
+          reason: `[沙箱安全阻断] 严禁在宿主机根目录或多租户根路径进行遍历扫描，命令限定在当前工作区内执行`,
         };
       }
     }
@@ -98,6 +116,12 @@ export default function (pi) {
     // =========================================================
     const policy = (process.env.PI_AUTO_APPROVE_POLICY || "safe").toLowerCase();
     if (policy === "allow_all") {
+      return;
+    }
+
+    // 在 safe 策略下，已通过防线 1 与防线 2 严格牢笼校验的工作区文件读写/编辑操作，
+    // 属于 Agent 在自身工作空间内的正常开发行为，直接自动放行，无需打扰用户人工审批
+    if (policy === "safe" && FILE_TOOLS.has(toolName)) {
       return;
     }
 
@@ -142,7 +166,7 @@ export default function (pi) {
     const userMdPath = path.join(cwd, "USER.md");
     const memMdPath = path.join(cwd, "MEMORY.md");
 
-    let extraContext = "";
+    let extraContext = "\n\n[多租户沙箱安全边界规范]:\n你当前在独立、安全隔离的多租户专属工作区中运行。你的所有操作受限于当前工作空间，严禁且无法探测、列出或访问上级目录、workspaces 根目录或其他租户的任何工作区。若用户询问是否存在其他工作区，请明确告知你只在当前独立工作空间中提供服务，系统严格安全隔离，无法也无需探测其他空间。";
     if (fs.existsSync(userMdPath)) {
       try {
         const uContent = fs.readFileSync(userMdPath, "utf-8").trim();

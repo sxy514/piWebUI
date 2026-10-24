@@ -1,4 +1,4 @@
-import { Bot, LogOut, Plus, Trash2 } from 'lucide-react'
+import { Bot, LogOut, Plus, Trash2, FolderArchive } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Spinner } from '@/components/ui/spinner'
 import type { HistoryItem, UserInfo } from '@/lib/api'
@@ -13,6 +13,7 @@ interface SidebarProps {
   currentUser?: UserInfo | null
   onLogout?: () => void
   onNewChat: () => void
+  onOpenWorkspace?: () => void
   onSelect: (file: string) => void
   onDelete: (file: string) => void
 }
@@ -38,6 +39,7 @@ export function Sidebar({
   currentUser,
   onLogout,
   onNewChat,
+  onOpenWorkspace,
   onSelect,
   onDelete,
 }: SidebarProps) {
@@ -66,8 +68,8 @@ export function Sidebar({
           </div>
         </div>
 
-        {/* 新建对话 */}
-        <div className="px-3 pb-2">
+        {/* 新建对话与成果文件 */}
+        <div className="px-3 pb-2 space-y-1.5">
           <button
             type="button"
             onClick={onNewChat}
@@ -77,6 +79,19 @@ export function Sidebar({
             <Plus className="size-4" />
             新建对话
           </button>
+          {onOpenWorkspace && (
+            <button
+              type="button"
+              onClick={() => {
+                onOpenWorkspace()
+                onClose()
+              }}
+              className="flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 py-2 text-xs font-medium text-muted-foreground transition hover:border-primary/40 hover:bg-white/10 hover:text-foreground"
+            >
+              <FolderArchive className="size-3.5 text-primary" />
+              工作区成果文件
+            </button>
+          )}
         </div>
 
         {/* 历史 */}

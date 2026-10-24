@@ -20,7 +20,11 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, Response
+import io
+import zipfile
+import mimetypes
+from datetime import datetime
 from pydantic import BaseModel
 from pi_agent import AsyncPiClient, Event, Limits, PiBusyError, PiError, PiRunError
 
@@ -129,7 +133,6 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\bpiweb\.db\b",
     r"\bjwt\.secret\b",
     r"\.pi[\\/]sessions",
-    r"\bworkspaces[\\/][a-zA-Z0-9_\-]+",
     r"\bctx_execute\b",
     # 破坏性文件/磁盘删除
     r"\brm\s+-[rf]{1,2}\b",
@@ -179,6 +182,9 @@ async def clean_idle_clients():
                 if now - last_time > CLIENT_IDLE_TIMEOUT
             ]
             for key in idle_keys:
+                lock = _client_locks.get(key)
+                if lock and lock.locked():
+                    continue  # 任务进行中，推迟回收以防中断活跃任务
                 client = _clients.pop(key, None)
                 _client_locks.pop(key, None)
                 _client_last_active.pop(key, None)
@@ -283,6 +289,13 @@ class AuthMiddleware:
         elif b"x-auth-token" in headers:
             token = headers[b"x-auth-token"].decode("utf-8").strip()
 
+        if not token and scope.get("query_string"):
+            from urllib.parse import parse_qs
+            qs = scope.get("query_string", b"").decode("utf-8")
+            parsed = parse_qs(qs)
+            if "token" in parsed and parsed["token"]:
+                token = parsed["token"][0].strip()
+
         if not token:
             res = JSONResponse({"detail": "未登录或缺少身份凭证，请先登录"}, status_code=401)
             return await res(scope, receive, send)
@@ -370,6 +383,21 @@ def make_ui_handler(client_key: str):
         # 0. 核心安全红线：严禁任何工具探测/读写系统敏感元数据与跨租户会话目录 (.pi, piweb.db, jwt.secret)
         if re.search(r"(?:[\\/]\.pi(?:[\\/]|$)|^\.pi(?:[\\/]|$)|piweb\.db|jwt\.secret|\.pi[\\/]sessions)", full_desc, re.I):
             log.warning("🚨 [沙箱阻断] 拦截到涉及系统元数据/多租户敏感目录的未授权操作: %s", full_desc)
+            return False
+
+        # 严禁探测多租户根目录 (workspaces) 或访问其他租户的工作区
+        user_id = client_key.split(":")[0] if ":" in client_key else ""
+        if "workspaces" in full_desc.lower():
+            ws_matches = list(re.finditer(r"workspaces(?:[\\/]([a-zA-Z0-9_\-]+))?", full_desc, re.I))
+            for m in ws_matches:
+                target_sub = m.group(1)
+                if not target_sub or (user_id and target_sub.lower() != user_id.lower()):
+                    log.warning("🚨 [沙箱阻断] 拦截到试图探测或越权访问多租户工作区 [%s]: %s", target_sub or "workspaces", full_desc)
+                    return False
+
+        # 严禁通过 .. 向上逃逸工作区
+        if re.search(r"""(?:\.\.[\\/]|\.\.$|\.\.["'\s]|\bcd\s+\.\.)""", full_desc, re.I):
+            log.warning("🚨 [沙箱阻断] 拦截到试图通过 '..' 逃逸工作区的命令: %s", full_desc)
             return False
 
         # 1. deny 策略：一律拒绝
@@ -461,7 +489,20 @@ DEFAULT_AGENTS_TEMPLATE = """# Agent 行为准则与项目规范 (AGENTS.md)
 - **增量编辑**：进行代码修改时，尽量保持既有代码风格和注释完整性。
 - **环境适配**：终端命令优先使用兼容当前宿主机系统的语法。
 
-## 4. 用户专属约定
+## 4. 运行规则与沙箱安全边界 (系统级红线)
+- **严格空间受限 (Strict Jail)**：
+  - 你的所有文件读写、创建以及终端命令执行，**绝对且唯一受限于当前工作空间**。
+  - **严禁越界逃逸**：绝对禁止在命令或参数中使用 `..` 尝试向上逃逸、禁止切换目录（`cd ..`）、禁止扫描宿主机根驱动器（如 `C:\\`、`G:\\`）或上级工程目录。
+  - **多租户隔离红线**：系统中不存在任何对你开放的其他工作区，绝对禁止尝试探测、列出、遍历或访问 `workspaces` 根目录或其他任何租户的空间。
+  - **敏感元数据绝对禁区**：严禁探测、读取或修改任何以 `.pi` 开头的隐藏目录、系统数据库（`piweb.db`）、会话存储（`.pi/sessions`）或认证凭证（`jwt.secret`）。
+- **用户咨询答复规范**：
+  - 若用户询问“是否存在其他工作区”或要求“查看别的用户空间”，必须直接且明确地告知：“我当前运行在为你分配的专属独立安全沙箱中，系统实施了严格的租户隔离，我无法、也不会探测系统中可能存在的其他空间”。
+- **成果文件产出规范**：
+  - 生成的代码、报表、文档或产物保存在当前工作区相应子目录中，用户可直接在前端「成果文件」抽屉中一键下载或打包。
+- **高危破坏性指令警示**：
+  - 严禁执行未受保护的批量删除（如 `rm -rf /`、`del /s`）、磁盘格式化或关机等破坏性指令。
+
+## 5. 用户专属约定
 - 专属归属：用户 `{username}` 的私有工作区沙箱。
 """
 
@@ -1277,7 +1318,11 @@ async def delete_session_endpoint(req: DeleteSessionRequest, request: Request) -
     was_current = bool(current_file and target == Path(current_file).resolve())
 
     if was_current:
-        # 如果删除的是当前活动会话，先创建一个新会话解除写入锁定
+        # 如果删除的是当前活动会话，先安全中断当前任务并创建新会话
+        try:
+            await client.interrupt()
+        except Exception:
+            pass
         await client.new_session()
 
     try:
@@ -1286,3 +1331,200 @@ async def delete_session_endpoint(req: DeleteSessionRequest, request: Request) -
         raise HTTPException(status_code=500, detail=f"删除会话文件失败: {exc}") from exc
 
     return {"ok": True, "was_current": was_current}
+
+
+# -------------------------------------------------------------
+# 工作区文件获取与下载 API
+# -------------------------------------------------------------
+
+def format_file_size(size_bytes: int) -> str:
+    """人类可读的文件大小格式化。"""
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes} B"
+
+
+def is_forbidden_workspace_path(rel_path: str) -> bool:
+    """沙箱阻断：严禁访问或下载系统内部元数据与敏感凭证。"""
+    p = rel_path.replace("\\", "/").strip("/").lower()
+    forbidden_parts = {".pi", "node_modules", ".git", "__pycache__"}
+    parts = p.split("/")
+    for part in parts:
+        if part in forbidden_parts or part.endswith(".pyc"):
+            return True
+    if any(secret in p for secret in ["jwt.secret", "piweb.db", ".env"]):
+        return True
+    return False
+
+
+@app.get("/api/workspace/files")
+async def list_workspace_files(request: Request) -> dict[str, Any]:
+    """获取当前登录用户独立工作区下的文件与目录列表。"""
+    user: User | None = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+
+    workspace_dir = get_user_workspace_dir(user.id, user.username)
+    if not workspace_dir.exists():
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    items = []
+    total_size = 0
+    total_files = 0
+
+    try:
+        count = 0
+        MAX_FILES = 1000
+        for p in workspace_dir.rglob("*"):
+            if count >= MAX_FILES:
+                break
+            if p.is_symlink():
+                continue
+            try:
+                rel = p.relative_to(workspace_dir).as_posix()
+                resolved_rel = p.resolve().relative_to(workspace_dir.resolve()).as_posix()
+            except ValueError:
+                continue
+
+            if is_forbidden_workspace_path(rel) or is_forbidden_workspace_path(resolved_rel):
+                continue
+
+            count += 1
+            is_dir = p.is_dir()
+            size = 0
+            mtime = 0
+            try:
+                stat = p.stat()
+                size = stat.st_size if not is_dir else 0
+                mtime = stat.st_mtime
+            except OSError:
+                pass
+
+            ext = p.suffix.lstrip(".").lower() if not is_dir else ""
+
+            if not is_dir:
+                total_files += 1
+                total_size += size
+
+            items.append({
+                "name": p.name,
+                "path": rel,
+                "is_dir": is_dir,
+                "size": size,
+                "size_formatted": format_file_size(size) if not is_dir else "-",
+                "mtime": mtime,
+                "extension": ext,
+            })
+    except Exception as exc:
+        log.warning("扫描工作区文件失败: %s", exc)
+
+    # 排序：修改时间倒序（最新生成的排在前面）
+    items.sort(key=lambda x: (not x["is_dir"], x["mtime"]), reverse=True)
+
+    return {
+        "workspace": str(workspace_dir.name),
+        "total_files": total_files,
+        "total_size": total_size,
+        "total_size_formatted": format_file_size(total_size),
+        "items": items,
+    }
+
+
+@app.get("/api/workspace/file/download")
+async def download_workspace_file(path: str, preview: bool = False, request: Request = None) -> Response:
+    """下载或预览工作区内的单个文件。"""
+    user: User | None = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+
+    if not path or not path.strip():
+        raise HTTPException(status_code=400, detail="缺少文件路径")
+
+    workspace_dir = get_user_workspace_dir(user.id, user.username)
+    if not workspace_dir.exists():
+        raise HTTPException(status_code=404, detail="工作区不存在")
+
+    clean_path = path.strip().replace("\\", "/")
+    if is_forbidden_workspace_path(clean_path):
+        raise HTTPException(status_code=403, detail="禁止访问敏感文件")
+
+    target_path = (workspace_dir / clean_path).resolve()
+    try:
+        resolved_rel = target_path.relative_to(workspace_dir.resolve()).as_posix()
+    except ValueError:
+        raise HTTPException(status_code=403, detail="非法越界访问")
+
+    if is_forbidden_workspace_path(resolved_rel):
+        raise HTTPException(status_code=403, detail="禁止访问敏感文件")
+
+    if not target_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    mime_type, _ = mimetypes.guess_type(target_path.name)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+
+    disposition_type = "inline" if preview else "attachment"
+
+    from urllib.parse import quote
+    filename_encoded = quote(target_path.name)
+    headers = {
+        "Content-Disposition": f"{disposition_type}; filename*=UTF-8''{filename_encoded}"
+    }
+
+    return FileResponse(
+        path=target_path,
+        media_type=mime_type,
+        headers=headers,
+    )
+
+
+@app.get("/api/workspace/archive")
+async def download_workspace_archive(request: Request) -> Response:
+    """将当前用户工作区的所有生成成果打包为 ZIP 压缩包下载。"""
+    user: User | None = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+
+    workspace_dir = get_user_workspace_dir(user.id, user.username)
+    if not workspace_dir.exists():
+        raise HTTPException(status_code=404, detail="工作区不存在")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        count = 0
+        MAX_ARCHIVE_FILES = 2000
+        for p in workspace_dir.rglob("*"):
+            if count >= MAX_ARCHIVE_FILES:
+                break
+            if not p.is_file() or p.is_symlink():
+                continue
+            try:
+                rel = p.relative_to(workspace_dir).as_posix()
+                resolved_rel = p.resolve().relative_to(workspace_dir.resolve()).as_posix()
+            except ValueError:
+                continue
+            if is_forbidden_workspace_path(rel) or is_forbidden_workspace_path(resolved_rel):
+                continue
+            zf.write(p, rel)
+            count += 1
+
+    data = buf.getvalue()
+    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_uname = re.sub(r"[^a-zA-Z0-9_\-]", "", user.username) or "user"
+    zip_filename = f"workspace_{safe_uname}_{now_str}.zip"
+    from urllib.parse import quote
+    filename_encoded = quote(zip_filename)
+
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{filename_encoded}",
+            "Content-Length": str(len(data)),
+        },
+    )

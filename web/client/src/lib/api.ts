@@ -227,12 +227,16 @@ export async function verifyAuthToken(_token: string): Promise<boolean> {
   return false
 }
 
-function authFetch(url: string, init?: RequestInit): Promise<Response> {
+async function authFetch(url: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers)
   if (authToken) {
     headers.set('Authorization', `Bearer ${authToken}`)
   }
-  return fetch(url, { ...init, headers })
+  const res = await fetch(url, { ...init, headers })
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent('pi-unauthorized'))
+  }
+  return res
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
@@ -398,4 +402,54 @@ export async function getSessionStats(clientId: string): Promise<SessionStatsPay
     /* ignore */
   }
   return null
+}
+
+
+export interface WorkspaceItem {
+  name: string
+  path: string
+  is_dir: boolean
+  size: number
+  size_formatted: string
+  mtime: number
+  extension: string
+}
+
+export interface WorkspaceFilesResponse {
+  workspace: string
+  total_files: number
+  total_size: number
+  total_size_formatted: string
+  items: WorkspaceItem[]
+}
+
+export async function getWorkspaceFiles(): Promise<WorkspaceFilesResponse> {
+  const res = await authFetch('/api/workspace/files')
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || '获取工作区文件失败')
+  }
+  return res.json()
+}
+
+export function getWorkspaceDownloadUrl(filePath: string, preview = false): string {
+  const token = getAuthToken()
+  const params = new URLSearchParams({
+    path: filePath,
+    preview: preview ? 'true' : 'false',
+  })
+  if (token) {
+    params.set('token', token)
+  }
+  return `/api/workspace/file/download?${params.toString()}`
+}
+
+export function getWorkspaceArchiveUrl(): string {
+  const token = getAuthToken()
+  const params = new URLSearchParams()
+  if (token) {
+    params.set('token', token)
+  }
+  const q = params.toString()
+  return `/api/workspace/archive${q ? `?${q}` : ''}`
 }
