@@ -42,6 +42,7 @@ export interface SessionInfo {
   model: string
   session_id: string | null
   user?: UserInfo
+  context_window?: number
 }
 
 export interface HistoryItem {
@@ -55,6 +56,31 @@ export interface ModelItem {
   id: string
   name: string
   provider: string
+  context_window?: number
+}
+
+export interface ContextUsageInfo {
+  tokens: number
+  contextWindow: number
+  percent: number
+}
+
+export interface SessionStatsPayload {
+  sessionFile: string | null
+  sessionId: string | null
+  userMessages: number
+  assistantMessages: number
+  toolCalls: number
+  totalMessages: number
+  tokens: {
+    input: number
+    output: number
+    cacheRead?: number
+    cacheWrite?: number
+    total: number
+  }
+  cost: number
+  contextUsage: ContextUsageInfo
 }
 
 export interface MessagesPayload {
@@ -360,4 +386,16 @@ export async function sendChat(
       }
     }
   }
+}
+
+export async function getSessionStats(clientId: string): Promise<SessionStatsPayload | null> {
+  try {
+    const res = await authFetch(`/api/stats?client_id=${encodeURIComponent(clientId)}`)
+    if (res.ok) {
+      return await res.json()
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
 }

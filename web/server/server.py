@@ -124,6 +124,13 @@ if PI_WORKSPACE_DIR:
     log.info("📂 自定义工作目录基准: %s", PI_WORKSPACE_DIR)
 
 DANGEROUS_COMMAND_PATTERNS = [
+    # 敏感元数据与跨租户会话目录探测（严禁越权窃取）
+    r"(?:[\\/]\.pi(?:[\\/]|$)|^\.pi(?:[\\/]|$))",
+    r"\bpiweb\.db\b",
+    r"\bjwt\.secret\b",
+    r"\.pi[\\/]sessions",
+    r"\bworkspaces[\\/][a-zA-Z0-9_\-]+",
+    r"\bctx_execute\b",
     # 破坏性文件/磁盘删除
     r"\brm\s+-[rf]{1,2}\b",
     r"\bdel\s+/[fFqsSQ\s]+",
@@ -360,6 +367,11 @@ def make_ui_handler(client_key: str):
         full_desc = f"{title}\n{message}"
         is_dangerous = bool(_DANGEROUS_REGEX.search(full_desc))
 
+        # 0. 核心安全红线：严禁任何工具探测/读写系统敏感元数据与跨租户会话目录 (.pi, piweb.db, jwt.secret)
+        if re.search(r"(?:[\\/]\.pi(?:[\\/]|$)|^\.pi(?:[\\/]|$)|piweb\.db|jwt\.secret|\.pi[\\/]sessions)", full_desc, re.I):
+            log.warning("🚨 [沙箱阻断] 拦截到涉及系统元数据/多租户敏感目录的未授权操作: %s", full_desc)
+            return False
+
         # 1. deny 策略：一律拒绝
         if AUTO_APPROVE_POLICY == "deny":
             log.warning("policy=deny: 自动拦截确认请求: %s", title or message)
@@ -430,13 +442,88 @@ def get_user_session_dir(user_id: str) -> Path:
     return target
 
 
+DEFAULT_AGENTS_TEMPLATE = """# Agent 行为准则与项目规范 (AGENTS.md)
+
+> 此文件定义专属 Agent 的工作流准则、角色定位与代码工程规范。
+> pi 会在每次会话启动时自动加载此文件。
+
+## 1. 角色定位与回复风格
+- **身份定位**：全能型软件工程师与高级开发助理。
+- **回复风格**：直接、精准、清晰。优先给出可落地的解决方案和完整代码，避免冗余寒暄。
+- **语言习惯**：中文交流，专业术语保留标准英文表达。
+
+## 2. 个人画像与长期记忆协同
+- **用户个性化**：请结合专属 `USER.md` 中的偏好为用户提供贴合习惯的解答。
+- **长期记忆维护**：当用户达成重要技术共识、设定项目约定或纠正错误时，主动通过工具更新沉淀到专属 `MEMORY.md` 中。
+
+## 3. 编码与工程规范
+- **代码质量**：注重安全性、健壮性与边界异常处理。
+- **增量编辑**：进行代码修改时，尽量保持既有代码风格和注释完整性。
+- **环境适配**：终端命令优先使用兼容当前宿主机系统的语法。
+
+## 4. 用户专属约定
+- 专属归属：用户 `{username}` 的私有工作区沙箱。
+"""
+
+DEFAULT_USER_TEMPLATE = """# 用户画像与个人偏好 (USER.md)
+
+> 此文件记录当前用户的个人偏好与交互习惯，系统会在每次对话前自动加载此配置。
+> 您可以直接在此修改，也可以在聊天中让 AI 帮您更新。
+
+## 1. 基础信息
+- **用户称呼**：`{username}`
+- **技术角色**：软件工程师 / 架构师
+- **工作语言**：中文（技术名词保留英文）
+
+## 2. 交互偏好
+- **直奔主题**：解答直接切入核心，无需过多铺垫说明。
+- **代码优先**：涉及功能实现时，优先给出规范、完整的代码片段。
+- **方案对比**：存在多种方案时，先简要列出优缺点与推荐方案。
+"""
+
+DEFAULT_MEMORY_TEMPLATE = """# 长期知识记忆库 (MEMORY.md)
+
+> 此文件是专属工作区的跨会话记忆库。系统在每次对话时会自动加载这里的记忆。
+> 当您与 AI 聊到重要技术决策、常用环境配置或特定业务规则时，AI 会将要点沉淀在此。
+
+## 1. 基础环境事实
+- 归属用户：`{username}`
+- 默认沙箱：本工作区
+
+## 2. 核心技术约定
+- （暂无，在对话中确认的架构约定或开发偏好将自动记录在此）
+
+## 3. 踩坑与避坑记录
+- （暂无，历史排查解决的特殊 Bug 或关键配置将记录在此）
+"""
+
+
+def ensure_user_agent_config(workspace_dir: Path, username: str = "") -> None:
+    """确保用户工作区内拥有完整的 Agent 三件套配置文件 (AGENTS.md, USER.md, MEMORY.md)。"""
+    uname = username or "developer"
+    configs = [
+        ("AGENTS.md", DEFAULT_AGENTS_TEMPLATE),
+        ("USER.md", DEFAULT_USER_TEMPLATE),
+        ("MEMORY.md", DEFAULT_MEMORY_TEMPLATE),
+    ]
+    for filename, template in configs:
+        target_file = workspace_dir / filename
+        if not target_file.is_file():
+            try:
+                content = template.replace("{username}", uname)
+                target_file.write_text(content, encoding="utf-8")
+                log.info("已为用户工作区自动就绪配置文件: %s", target_file)
+            except Exception as e:
+                log.warning("初始化 %s 失败: %s", filename, e)
+
+
 def get_user_workspace_dir(user_id: str, username: str = "") -> Path:
     """获取用户的工作区沙箱目录（Agent 执行命令、读写文件的工作目录）。"""
     safe_uid = re.sub(r"[^a-zA-Z0-9_\-]", "", user_id) or "default"
+    safe_uname = re.sub(r"[^a-zA-Z0-9_\-]", "", username) if username else safe_uid
     if PI_WORKSPACE_DIR:
         # 支持占位符 {user_id} 或 {username}
         rendered = PI_WORKSPACE_DIR.replace("{user_id}", safe_uid)
-        safe_uname = re.sub(r"[^a-zA-Z0-9_\-]", "", username) if username else safe_uid
         rendered = rendered.replace("{username}", safe_uname)
         target = Path(rendered)
         if not target.is_absolute():
@@ -448,6 +535,7 @@ def get_user_workspace_dir(user_id: str, username: str = "") -> Path:
         target = (PROJECT_DIR / "workspaces" / safe_uid).resolve()
 
     target.mkdir(parents=True, exist_ok=True)
+    ensure_user_agent_config(target, safe_uname)
     return target
 
 
@@ -653,6 +741,8 @@ async def create_session(req: ClientRequest, request: Request) -> dict[str, Any]
     return {
         "client_id": client_id,
         "model": f"{model.get('provider')}/{model.get('id')}",
+        "context_window": model.get("contextWindow", 262144),
+        "max_tokens": model.get("maxTokens", 8192),
         "session_id": state.get("sessionId"),
         "user": user.to_dict(),
     }
@@ -1057,7 +1147,13 @@ async def models(request: Request) -> list[dict[str, Any]]:
         try:
             available = await client.get_available_models()
             return [
-                {"id": m.get("id"), "name": m.get("name"), "provider": m.get("provider")}
+                {
+                    "id": m.get("id"),
+                    "name": m.get("name"),
+                    "provider": m.get("provider"),
+                    "context_window": m.get("contextWindow", 262144),
+                    "max_tokens": m.get("maxTokens", 8192),
+                }
                 for m in available
             ]
         except PiError:
@@ -1067,7 +1163,13 @@ async def models(request: Request) -> list[dict[str, Any]]:
     temp_client = await get_client(user.id, "probe")
     available = await temp_client.get_available_models()
     return [
-        {"id": m.get("id"), "name": m.get("name"), "provider": m.get("provider")}
+        {
+            "id": m.get("id"),
+            "name": m.get("name"),
+            "provider": m.get("provider"),
+            "context_window": m.get("contextWindow", 262144),
+            "max_tokens": m.get("maxTokens", 8192),
+        }
         for m in available
     ]
 
@@ -1081,7 +1183,11 @@ async def set_model(req: ModelRequest, request: Request) -> dict[str, Any]:
         model = await client.set_model(req.provider, req.model_id)
     except PiError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"model": f"{model.get('provider')}/{model.get('id')}"}
+    return {
+        "model": f"{model.get('provider')}/{model.get('id')}",
+        "context_window": model.get("contextWindow", 262144),
+        "max_tokens": model.get("maxTokens", 8192),
+    }
 
 
 @app.get("/api/history")

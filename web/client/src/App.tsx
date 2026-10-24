@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Composer } from '@/components/Composer'
 import { EmptyState } from '@/components/EmptyState'
 import { MessageItem } from '@/components/MessageItem'
@@ -7,6 +7,7 @@ import { Sidebar } from '@/components/Sidebar'
 import { ThemeMenu } from '@/components/ThemeMenu'
 import { Spinner } from '@/components/ui/spinner'
 import { AuthModal } from '@/components/AuthModal'
+import { SessionUsage, formatTokens, type SessionStats } from '@/components/SessionUsage'
 import {
   createSession,
   getAuthStatus,
@@ -30,6 +31,8 @@ import {
   type ModelItem,
   type SessionInfo,
   type StreamEvent,
+  getSessionStats,
+  type ContextUsageInfo,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { CircleAlert, LogOut, Menu, Plus, User as UserIcon } from 'lucide-react'
@@ -51,6 +54,70 @@ export default function App() {
   const [authRemember, setAuthRemember] = useState<string>('true')
   const [currentUser, setCurrentUser] = useState<UserInfo | null>(null)
   const [hasUsers, setHasUsers] = useState<boolean>(true)
+
+  const [liveContextUsage, setLiveContextUsage] = useState<ContextUsageInfo | null>(null)
+
+  const refreshStats = useCallback(async (clientId: string) => {
+    try {
+      const data = await getSessionStats(clientId)
+      if (data?.contextUsage) {
+        setLiveContextUsage(data.contextUsage)
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  const sessionStats: SessionStats = useMemo(() => {
+    let totalTokens = 0
+    let inputTokens = 0
+    let outputTokens = 0
+    let totalCost = 0
+    let totalElapsed = 0
+    let turns = 0
+    let lastContextTokens = 0
+
+    for (const m of messages) {
+      if (m.role === 'assistant') {
+        if (m.usage) {
+          const inp = m.usage.input_tokens || 0
+          const out = m.usage.output_tokens || 0
+          const tot = m.usage.total_tokens || (inp + out)
+          totalTokens += tot
+          inputTokens += inp
+          outputTokens += out
+          totalCost += m.usage.cost || 0
+          lastContextTokens = inp + out
+        }
+        if (m.elapsed) {
+          totalElapsed += m.elapsed
+        }
+        turns += 1
+      }
+    }
+
+    const contextWindow = liveContextUsage?.contextWindow || session?.context_window || 262144
+    const contextUsed = liveContextUsage?.tokens || lastContextTokens || 0
+    const remainingTokens = Math.max(0, contextWindow - contextUsed)
+    const usedPercent = contextWindow > 0
+      ? Math.max(0, Math.min(100, Math.round((contextUsed / contextWindow) * 100)))
+      : 0
+    const remainingPercent = Math.max(0, 100 - usedPercent)
+
+    return {
+      turns,
+      totalTokens,
+      inputTokens,
+      outputTokens,
+      totalCost,
+      totalElapsed: Math.round(totalElapsed * 10) / 10,
+      contextWindow,
+      contextUsed,
+      remainingTokens,
+      remainingPercent,
+      usedPercent,
+    }
+  }, [messages, liveContextUsage, session])
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -87,6 +154,7 @@ export default function App() {
       const info = await createSession(storedClientId)
       localStorage.setItem('pi_client_id', info.client_id)
       setSession(info)
+      void refreshStats(info.client_id)
 
       const [msgsRes] = await Promise.all([
         getMessages(info.client_id).catch(() => null),
@@ -368,6 +436,7 @@ export default function App() {
           ),
         }))
         void refreshHistory(session.client_id)
+        void refreshStats(session.client_id)
       }
     },
     [session, streaming, applyEvent, patchLastAssistant, refreshHistory],
@@ -600,6 +669,7 @@ export default function App() {
                 />
                 {streaming ? '生成中' : '就绪'}
               </span>
+              <SessionUsage stats={sessionStats} />
               {currentUser && (
                 <div className="hidden items-center gap-1.5 rounded-full border border-white/10 bg-white/6 px-2.5 py-1 text-xs sm:flex">
                   <UserIcon className="size-3.5 text-primary" />
@@ -682,9 +752,14 @@ export default function App() {
                 onSend={send}
                 onStop={() => void handleStop()}
               />
-              <p className="mt-2 text-center text-[11px] text-muted-foreground/60">
-                内容由 AI 生成，请注意甄别 · Enter 发送
-              </p>
+              <div className="mt-2 flex items-center justify-between px-1 text-[11px] text-muted-foreground/60">
+                <span>内容由 AI 生成，请注意甄别 · Enter 发送</span>
+                {sessionStats.totalTokens > 0 && (
+                  <span className="hidden font-mono sm:inline">
+                    会话消耗: {formatTokens(sessionStats.totalTokens)} tokens (↓{formatTokens(sessionStats.inputTokens)} ↑{formatTokens(sessionStats.outputTokens)})
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         </div>
