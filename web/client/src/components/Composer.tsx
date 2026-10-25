@@ -95,7 +95,7 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(
     return (
       <div
         className={cn(
-          'glass rounded-3xl px-3 pt-2 pb-2.5 transition-all border',
+          'glass rounded-3xl px-2.5 sm:px-3 pt-2 pb-2 sm:pb-2.5 transition-all border',
           dragOver ? 'border-primary ring-2 ring-primary/20 bg-primary/5' : 'border-white/10'
         )}
         onDragOver={(e) => {
@@ -182,12 +182,12 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(
           }}
           placeholder={
             streaming
-              ? '生成中… 可点击右侧按钮停止'
+              ? '生成中… 点击右侧按钮可停止'
               : attachments.length > 0
-                ? '输入关于所选附件的提问或分析要求，Enter 发送'
-                : '输入消息，或拖拽/粘贴/点击回形针上传图片或文档，Enter 发送'
+                ? '输入关于所选附件的提问…'
+                : '输入消息，或点击 📎 上传附件…'
           }
-          className="min-h-11 max-h-44 flex-1 resize-none border-none bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 text-sm"
+          className="min-h-11 max-h-44 flex-1 resize-none border-none bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 text-base sm:text-sm"
           rows={1}
         />
 

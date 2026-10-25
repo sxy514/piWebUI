@@ -25,16 +25,20 @@ export function SessionUsage({ stats }: { stats: SessionStats }) {
   const [open, setOpen] = useState(false)
   const popoverRef = useRef<HTMLDivElement>(null)
 
-  // 点击外部自动关闭
+  // 点击外部自动关闭 (支持移动端触屏与鼠标)
   useEffect(() => {
-    function handleClickOutside(event: MouseEvent) {
+    function handleClickOutside(event: MouseEvent | TouchEvent) {
       if (popoverRef.current && !popoverRef.current.contains(event.target as Node)) {
         setOpen(false)
       }
     }
     if (open) {
       document.addEventListener('mousedown', handleClickOutside)
-      return () => document.removeEventListener('mousedown', handleClickOutside)
+      document.addEventListener('touchstart', handleClickOutside)
+      return () => {
+        document.removeEventListener('mousedown', handleClickOutside)
+        document.removeEventListener('touchstart', handleClickOutside)
+      }
     }
   }, [open])
 
@@ -50,7 +54,7 @@ export function SessionUsage({ stats }: { stats: SessionStats }) {
       <button
         type="button"
         onClick={() => setOpen((prev) => !prev)}
-        className="group flex cursor-pointer items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-muted-foreground transition hover:border-primary/40 hover:bg-white/10 hover:text-foreground"
+        className="group flex cursor-pointer items-center gap-1 sm:gap-1.5 rounded-full border border-white/10 bg-white/5 px-2 sm:px-2.5 py-1 text-xs text-muted-foreground transition hover:border-primary/40 hover:bg-white/10 hover:text-foreground"
         title="查看当前会话消耗与上下文窗口占用"
       >
         <Zap className="size-3.5 text-amber-400 group-hover:scale-110 transition-transform" />
@@ -66,7 +70,7 @@ export function SessionUsage({ stats }: { stats: SessionStats }) {
           {usedPercent}%
         </span>
         <ChevronDown
-          className={`size-3 text-muted-foreground/60 transition-transform duration-200 ${
+          className={`hidden sm:inline-block size-3 text-muted-foreground/60 transition-transform duration-200 ${
             open ? 'rotate-180' : ''
           }`}
         />
@@ -74,7 +78,15 @@ export function SessionUsage({ stats }: { stats: SessionStats }) {
 
       {/* 展开的消耗与上下文窗口详情弹层 */}
       {open && (
-        <div className="glass absolute right-0 top-full z-50 mt-2 w-72 rounded-2xl border border-white/10 bg-background/95 p-4 shadow-2xl backdrop-blur-xl animate-in fade-in zoom-in-95 duration-150">
+        <>
+          {/* 移动端轻量遮罩，轻触任意处快速关闭 */}
+          <div
+            className="fixed inset-0 z-40 bg-black/40 backdrop-blur-xs sm:hidden"
+            onClick={() => setOpen(false)}
+          />
+
+          {/* 详情弹层：移动端自动居中并保持左右安全边距，桌面端对齐按钮右下 */}
+          <div className="glass fixed inset-x-3 top-16 z-50 mx-auto w-auto max-w-sm rounded-2xl border border-white/10 bg-background/95 p-4 shadow-2xl backdrop-blur-xl animate-in fade-in zoom-in-95 duration-150 sm:absolute sm:inset-auto sm:right-0 sm:top-full sm:mt-2 sm:w-72 sm:max-w-none">
           <div className="flex items-center justify-between border-b border-white/8 pb-2.5">
             <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
               <Gauge className="size-3.5 text-primary" />
@@ -182,6 +194,7 @@ export function SessionUsage({ stats }: { stats: SessionStats }) {
             </div>
           </div>
         </div>
+        </>
       )}
     </div>
   )

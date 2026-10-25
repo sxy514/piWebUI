@@ -289,6 +289,29 @@ function MermaidModal({
 
   const handleMouseUp = () => setIsDragging(false)
 
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      setIsDragging(true)
+      dragStart.current = {
+        x: e.touches[0].clientX - pos.x,
+        y: e.touches[0].clientY - pos.y,
+      }
+    }
+  }
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (isDragging && e.touches.length === 1) {
+      setPos({
+        x: e.touches[0].clientX - dragStart.current.x,
+        y: e.touches[0].clientY - dragStart.current.y,
+      })
+    }
+  }
+
+  const handleTouchEnd = () => {
+    setIsDragging(false)
+  }
+
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(code)
@@ -316,12 +339,12 @@ function MermaidModal({
     >
       {/* 顶部工具栏 */}
       <div
-        className="flex items-center justify-between border-b border-border/60 bg-card/90 px-5 py-3 backdrop-blur-xl shadow-sm z-10"
+        className="flex items-center justify-between border-b border-border/60 bg-card/90 px-3 sm:px-5 py-2 sm:py-3 backdrop-blur-xl shadow-sm z-10 gap-1.5"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center gap-3">
-          <span className="text-sm font-semibold text-foreground">流程图全屏画板</span>
-          <span className="rounded-full border border-border bg-muted/60 px-2 py-0.5 font-mono text-xs text-muted-foreground">
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+          <span className="text-xs sm:text-sm font-semibold text-foreground truncate max-w-[90px] sm:max-w-none">流程图画板</span>
+          <span className="rounded-full border border-border bg-muted/60 px-1.5 sm:px-2 py-0.5 font-mono text-[11px] sm:text-xs text-muted-foreground">
             {Math.round(scale * 100)}%
           </span>
           <span className="text-[11px] text-muted-foreground/80 font-mono hidden sm:inline">
@@ -329,11 +352,11 @@ function MermaidModal({
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
           <button
             type="button"
             onClick={() => setScale((s) => Math.max(s - 0.2, 0.3))}
-            className="flex size-8 items-center justify-center rounded-lg border border-border bg-secondary/80 text-sm font-semibold text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
+            className="flex size-7 sm:size-8 items-center justify-center rounded-lg border border-border bg-secondary/80 text-xs sm:text-sm font-semibold text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
             title="缩小 (-)"
           >
             -
@@ -344,7 +367,7 @@ function MermaidModal({
               setScale(1)
               setPos({ x: 0, y: 0 })
             }}
-            className="flex h-8 items-center justify-center rounded-lg border border-border bg-secondary/80 px-3 font-mono text-xs text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
+            className="flex h-7 sm:h-8 items-center justify-center rounded-lg border border-border bg-secondary/80 px-2 sm:px-3 font-mono text-[11px] sm:text-xs text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
             title="重置缩放 (0)"
           >
             100%
@@ -352,30 +375,30 @@ function MermaidModal({
           <button
             type="button"
             onClick={() => setScale((s) => Math.min(s + 0.2, 4))}
-            className="flex size-8 items-center justify-center rounded-lg border border-border bg-secondary/80 text-sm font-semibold text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
+            className="flex size-7 sm:size-8 items-center justify-center rounded-lg border border-border bg-secondary/80 text-xs sm:text-sm font-semibold text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
             title="放大 (+)"
           >
             +
           </button>
 
-          <div className="mx-1 h-4 w-px bg-border" />
+          <div className="mx-0.5 sm:mx-1 h-4 w-px bg-border" />
 
           <button
             type="button"
             onClick={() => void handleCopy()}
-            className="flex h-8 items-center gap-1.5 rounded-lg border border-border bg-secondary/80 px-3 text-xs text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
+            className="flex h-7 sm:h-8 items-center gap-1 rounded-lg border border-border bg-secondary/80 px-2 sm:px-3 text-[11px] sm:text-xs text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
             title="复制代码"
           >
-            {copied ? '已复制！' : '复制代码'}
+            {copied ? '已复制' : '复制'}
           </button>
 
           <button
             type="button"
             onClick={handleDownloadSvg}
-            className="flex h-8 items-center gap-1.5 rounded-lg border border-border bg-secondary/80 px-3 text-xs text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
+            className="flex h-7 sm:h-8 items-center gap-1 rounded-lg border border-border bg-secondary/80 px-2 sm:px-3 text-[11px] sm:text-xs text-foreground transition hover:bg-muted active:scale-95 cursor-pointer"
             title="下载 SVG 矢量图"
           >
-            导出 SVG
+            <span className="hidden sm:inline">导出 </span>SVG
           </button>
 
           <button
@@ -391,11 +414,14 @@ function MermaidModal({
 
       {/* 画布拖拽视窗 */}
       <div
-        className="relative flex flex-1 items-center justify-center overflow-hidden cursor-grab active:cursor-grabbing p-6"
+        className="relative flex flex-1 items-center justify-center overflow-hidden cursor-grab active:cursor-grabbing p-2.5 sm:p-6 touch-none"
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
         onClick={(e) => e.stopPropagation()}
       >
         <div
@@ -414,8 +440,9 @@ function MermaidModal({
           />
         </div>
 
-        <div className="pointer-events-none absolute bottom-5 left-1/2 -translate-x-1/2 rounded-full border border-border bg-card/80 px-4 py-1.5 text-xs text-muted-foreground backdrop-blur-md shadow-lg">
-          🖱️ 鼠标滚轮缩放 · 拖拽平移 · ESC 退出
+        <div className="pointer-events-none absolute bottom-5 left-1/2 -translate-x-1/2 rounded-full border border-border bg-card/80 px-3 py-1 sm:px-4 sm:py-1.5 text-[11px] sm:text-xs text-muted-foreground backdrop-blur-md shadow-lg whitespace-nowrap">
+          <span className="sm:hidden">👆 单指拖拽平移 · 顶部按钮缩放</span>
+          <span className="hidden sm:inline">🖱️ 鼠标滚轮缩放 · 拖拽平移 · ESC 退出</span>
         </div>
       </div>
     </div>
