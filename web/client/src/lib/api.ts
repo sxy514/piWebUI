@@ -3,6 +3,7 @@ export interface Message {
   role: 'user' | 'assistant'
   parts: Part[]
   streaming: boolean
+  attachments?: Attachment[]
   usage?: UsageInfo | null
   elapsed?: number
   interrupted?: boolean
@@ -349,11 +350,16 @@ export async function sendChat(
   clientId: string,
   message: string,
   onEvent: (event: StreamEvent) => void,
+  attachments?: Attachment[],
 ): Promise<void> {
   const resp = await authFetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ client_id: clientId, message }),
+    body: JSON.stringify({
+      client_id: clientId,
+      message,
+      attachments: attachments || [],
+    }),
   })
   if (!resp.ok || !resp.body) {
     if (resp.status === 401) {
@@ -453,3 +459,38 @@ export function getWorkspaceArchiveUrl(): string {
   const q = params.toString()
   return `/api/workspace/archive${q ? `?${q}` : ''}`
 }
+
+
+export interface Attachment {
+  name: string
+  path: string
+  size: number
+  size_formatted: string
+  is_image: boolean
+  mime_type: string
+  data: string
+  extracted_text?: string
+}
+
+export async function uploadWorkspaceFile(file: File): Promise<Attachment> {
+  const form = new FormData()
+  form.append('file', file)
+  const token = getAuthToken()
+  const headers: Record<string, string> = {}
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  const res = await fetch('/api/workspace/upload', {
+    method: 'POST',
+    headers,
+    body: form,
+  })
+  if (!res.ok) {
+    if (res.status === 401) {
+      window.dispatchEvent(new CustomEvent('pi-unauthorized'))
+    }
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || '上传文件失败')
+  }
+  return res.json()
+}

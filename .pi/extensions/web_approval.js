@@ -91,7 +91,7 @@ export default function (pi) {
       const cmd = String(input.command || "");
 
       // 1. 严禁使用 .. 向上逃逸工作区
-      if (/(?:\.\.[\\/]|\.\.$|\.\.["'\s]|\bcd\s+\.\.)/i.test(cmd)) {
+      if (/(?:(?<!\.)\.\.(?!\.)(?:[\\/]|$|["'\s])|\bcd\s+\.\.)/i.test(cmd)) {
         return {
           block: true,
           reason: `[沙箱安全阻断] 严禁使用相对路径 '..' 向上越界逃逸当前工作区`,
@@ -132,7 +132,7 @@ export default function (pi) {
     let summary = "";
     if (toolName === "bash" || toolName === "powershell") {
       summary = input.command || JSON.stringify(input);
-    } else if (toolName === "write_file" || toolName === "edit_file") {
+    } else if (toolName === "write_file" || toolName === "edit_file" || toolName === "write" || toolName === "edit") {
       const p = input.path || "";
       const extra = input.content ? ` (写入长度: ${input.content.length})` : "";
       summary = `${p}${extra}`;

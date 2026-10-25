@@ -3,7 +3,7 @@ import { Markdown } from '@/components/Markdown'
 import { Spinner } from '@/components/ui/spinner'
 import type { Message, Part } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { Check, ChevronRight, Copy, RefreshCw, ShieldAlert, TriangleAlert, Wrench, X } from 'lucide-react'
+import { Check, ChevronRight, Copy, RefreshCw, ShieldAlert, TriangleAlert, Wrench, X, Paperclip } from 'lucide-react'
 
 interface MessageItemProps {
   msg: Message
@@ -21,10 +21,41 @@ export function MessageItem({
   if (msg.role === 'user') {
     const text = msg.parts.map((p) => (p.kind === 'text' ? p.text : '')).join('')
     return (
-      <div className="flex justify-end">
-        <div className="bubble-user max-w-[82%] rounded-2xl rounded-br-md px-4 py-2.5 text-[15px] leading-7 whitespace-pre-wrap text-white">
-          {text}
-        </div>
+      <div className="flex flex-col items-end gap-1.5">
+        {/* 附件展示 */}
+        {msg.attachments && msg.attachments.length > 0 && (
+          <div className="flex flex-wrap justify-end gap-1.5 max-w-[82%]">
+            {msg.attachments.map((att, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/10 px-2.5 py-1 text-xs text-white/90 backdrop-blur-md"
+              >
+                {att.is_image && att.data ? (
+                  <img
+                    src={`data:${att.mime_type};base64,${att.data}`}
+                    alt={att.name}
+                    className="size-4.5 rounded object-cover"
+                  />
+                ) : (
+                  <Paperclip className="size-3 text-primary" />
+                )}
+                <span className="font-mono text-[11px] font-medium max-w-[150px] truncate">
+                  {att.name}
+                </span>
+                <span className="font-mono text-[10px] text-white/60">
+                  {att.size_formatted}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* 文本气泡 */}
+        {text && (
+          <div className="bubble-user max-w-[82%] rounded-2xl rounded-br-md px-4 py-2.5 text-[15px] leading-7 whitespace-pre-wrap text-white">
+            {text}
+          </div>
+        )}
       </div>
     )
   }

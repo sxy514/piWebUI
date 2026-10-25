@@ -34,6 +34,7 @@ import {
   type StreamEvent,
   getSessionStats,
   type ContextUsageInfo,
+  type Attachment,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { CircleAlert, LogOut, Menu, Plus, User as UserIcon, FolderArchive } from 'lucide-react'
@@ -50,6 +51,7 @@ export default function App() {
   const [history, setHistory] = useState<HistoryItem[]>([])
   const [models, setModels] = useState<ModelItem[]>([])
   const [workspaceDrawerOpen, setWorkspaceDrawerOpen] = useState(false)
+  const [attachments, setAttachments] = useState<Attachment[]>([])
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [switching, setSwitching] = useState(false)
   const [needAuth, setNeedAuth] = useState(false)
@@ -390,13 +392,20 @@ export default function App() {
   )
 
   const doSend = useCallback(
-    async (text: string, echo: boolean) => {
+    async (text: string, echo: boolean, currentAttachments?: Attachment[]) => {
       if (!session || streaming) return
 
+      const attsToSend = currentAttachments || []
       setStreaming(true)
       setMessages((prev) => {
         const userMsg: Message | null = echo
-          ? { id: newId(), role: 'user', parts: [{ kind: 'text', text }], streaming: false }
+          ? {
+              id: newId(),
+              role: 'user',
+              parts: [{ kind: 'text', text }],
+              attachments: attsToSend.length > 0 ? attsToSend : undefined,
+              streaming: false,
+            }
           : null
         const assistantMsg: Message = {
           id: newId(),
@@ -408,7 +417,7 @@ export default function App() {
       })
 
       try {
-        await sendChat(session.client_id, text, applyEvent)
+        await sendChat(session.client_id, text, applyEvent, attsToSend)
         setMessages((prev) => {
           const stillOpen = prev.some((m) => m.role === 'assistant' && m.streaming)
           if (!stillOpen) return prev
@@ -446,10 +455,13 @@ export default function App() {
 
   const send = useCallback(() => {
     const text = input.trim()
-    if (!text) return
+    if (!text && attachments.length === 0) return
+    const textToSend = text || (attachments.length > 0 ? '请查看并分析我上传的附件内容。' : '')
+    const currentAtts = [...attachments]
     setInput('')
-    void doSend(text, true)
-  }, [input, doSend])
+    setAttachments([])
+    void doSend(textToSend, true, currentAtts)
+  }, [input, attachments, doSend])
 
   const regenerate = useCallback(async () => {
     if (!session || streaming) return
@@ -759,9 +771,14 @@ export default function App() {
                 ref={textareaRef}
                 value={input}
                 streaming={streaming}
+                attachments={attachments}
                 onChange={setInput}
                 onSend={send}
                 onStop={() => void handleStop()}
+                onAddAttachment={(att) => setAttachments((prev) => [...prev, att])}
+                onRemoveAttachment={(index) =>
+                  setAttachments((prev) => prev.filter((_, i) => i !== index))
+                }
               />
               <div className="mt-2 flex items-center justify-between px-1 text-[11px] text-muted-foreground/60">
                 <span>内容由 AI 生成，请注意甄别 · Enter 发送</span>

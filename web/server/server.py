@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, Response
 import io
@@ -26,7 +26,8 @@ import zipfile
 import mimetypes
 from datetime import datetime
 from pydantic import BaseModel
-from pi_agent import AsyncPiClient, Event, Limits, PiBusyError, PiError, PiRunError
+from pi_agent import AsyncPiClient, Event, Limits, PiBusyError, PiError, PiRunError, ImageContent
+from extractor import extract_document_text
 
 from db import (
     init_db,
@@ -133,7 +134,6 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\bpiweb\.db\b",
     r"\bjwt\.secret\b",
     r"\.pi[\\/]sessions",
-    r"\bctx_execute\b",
     # 破坏性文件/磁盘删除
     r"\brm\s+-[rf]{1,2}\b",
     r"\bdel\s+/[fFqsSQ\s]+",
@@ -179,7 +179,8 @@ async def clean_idle_clients():
             idle_keys = [
                 key
                 for key, last_time in _client_last_active.items()
-                if now - last_time > CLIENT_IDLE_TIMEOUT
+                if (now - last_time > CLIENT_IDLE_TIMEOUT)
+                or (_clients.get(key) is not None and not _clients[key].running)
             ]
             for key in idle_keys:
                 lock = _client_locks.get(key)
@@ -331,9 +332,21 @@ class ClientRequest(BaseModel):
     client_id: str | None = None
 
 
+class AttachmentPayload(BaseModel):
+    name: str
+    path: str
+    size: int = 0
+    size_formatted: str = ""
+    is_image: bool = False
+    mime_type: str = ""
+    data: str = ""
+    extracted_text: str = ""
+
+
 class ChatRequest(BaseModel):
     client_id: str
     message: str
+    attachments: list[AttachmentPayload] = []
 
 
 class SwitchRequest(BaseModel):
@@ -396,7 +409,7 @@ def make_ui_handler(client_key: str):
                     return False
 
         # 严禁通过 .. 向上逃逸工作区
-        if re.search(r"""(?:\.\.[\\/]|\.\.$|\.\.["'\s]|\bcd\s+\.\.)""", full_desc, re.I):
+        if re.search(r"""(?<!\.)\.\.(?!\.)(?:[\\/]|$|['"\s])|\bcd\s+\.\.""", full_desc, re.I):
             log.warning("🚨 [沙箱阻断] 拦截到试图通过 '..' 逃逸工作区的命令: %s", full_desc)
             return False
 
@@ -613,17 +626,30 @@ def validate_session_path(session_file: str, allowed_dir: Path) -> Path:
 
 
 async def get_client(user_id: str, client_id: str) -> AsyncPiClient:
-    """安全获取或创建客户端实例，隔离工作区与独立会话目录。"""
+    """安全获取或创建客户端实例，隔离工作区与独立会话目录。底层进程若已终止则自动自愈重建。"""
     key = get_client_key(user_id, client_id)
     touch_client(key)
     client = _clients.get(key)
     if client is not None:
-        return client
+        if client.running:
+            return client
+        log.warning("检测到客户端实例 %s 底层进程未运行 (running=False)，自动注销回收并重新启动", key)
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        _clients.pop(key, None)
 
     async with _creation_lock:
         client = _clients.get(key)
         if client is not None:
-            return client
+            if client.running:
+                return client
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            _clients.pop(key, None)
 
         user = get_user_by_id(user_id)
         uname = user.username if user else ""
@@ -892,8 +918,30 @@ async def chat(req: ChatRequest, request: Request):
 
             async def drive_stream():
                 try:
+                    images: list[ImageContent] = []
+                    doc_sections: list[str] = []
+                    for att in req.attachments:
+                        if att.is_image and att.data:
+                            images.append(
+                                {
+                                    "type": "image",
+                                    "data": att.data,
+                                    "mimeType": att.mime_type or "image/png",
+                                }
+                            )
+                        else:
+                            doc_item = f"📎 **用户上传附件**: `{att.path}` ({att.size_formatted})"
+                            if att.extracted_text:
+                                doc_item += f"\n```text\n{att.extracted_text[:20000]}\n```"
+                            doc_sections.append(doc_item)
+
+                    final_message = req.message
+                    if doc_sections:
+                        final_message = "\n\n".join(doc_sections) + f"\n\n---\n**用户提问与任务要求**:\n{req.message}"
+
                     async with client.stream(
-                        req.message,
+                        final_message,
+                        images=images if images else None,
                         timeout=RUN_TIMEOUT,
                         command_timeout=PI_LIMITS.command_timeout,
                     ) as stream:
@@ -916,6 +964,9 @@ async def chat(req: ChatRequest, request: Request):
                 except Exception as exc:
                     await queue.put({"type": "__RUN_EVENT__", "payload": {"type": "error", "message": str(exc)}})
                 finally:
+                    if not client.running:
+                        log.warning("会话流结束后检测到底层客户端 %s 已退出，自动从缓存中清除", key)
+                        _clients.pop(key, None)
                     await queue.put({"type": "__STREAM_FINISHED__"})
 
             drive_task = asyncio.create_task(drive_stream())
@@ -1175,7 +1226,13 @@ async def stats(client_id: str, request: Request) -> dict[str, Any]:
     user, key = get_user_and_key(request, client_id)
     client = await get_client(user.id, client_id)
     touch_client(key)
-    return await client.get_session_stats()
+    try:
+        return await client.get_session_stats()
+    except Exception as e:
+        log.warning("获取 stats 失败: %s", e)
+        if not client.running:
+            _clients.pop(key, None)
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost": 0.0}
 
 
 @app.get("/api/models")
@@ -1237,8 +1294,14 @@ async def history(client_id: str, request: Request) -> dict[str, Any]:
     user, key = get_user_and_key(request, client_id)
     client = await get_client(user.id, client_id)
     touch_client(key)
-    state = await client.get_state()
-    current = state.get("sessionFile")
+    try:
+        state = await client.get_state()
+        current = state.get("sessionFile")
+    except Exception as e:
+        log.warning("获取 history 状态失败: %s", e)
+        if not client.running:
+            _clients.pop(key, None)
+        current = None
 
     folder = get_user_session_dir(user.id)
     items: list[dict[str, Any]] = []
@@ -1262,13 +1325,19 @@ async def get_messages_endpoint(client_id: str, request: Request) -> dict[str, A
     user, key = get_user_and_key(request, client_id)
     client = await get_client(user.id, client_id)
     touch_client(key)
-    raw = await client.get_messages()
-    state = await client.get_state()
-    return {
-        "messages": to_ui_messages(raw),
-        "session_file": state.get("sessionFile"),
-        "session_id": state.get("sessionId"),
-    }
+    try:
+        raw = await client.get_messages()
+        state = await client.get_state()
+        return {
+            "messages": to_ui_messages(raw),
+            "session_file": state.get("sessionFile"),
+            "session_id": state.get("sessionId"),
+        }
+    except Exception as e:
+        log.warning("获取 messages 失败: %s", e)
+        if not client.running:
+            _clients.pop(key, None)
+        return {"messages": [], "session_file": None, "session_id": None}
 
 
 @app.post("/api/switch")
@@ -1528,3 +1597,139 @@ async def download_workspace_archive(request: Request) -> Response:
             "Content-Length": str(len(data)),
         },
     )
+
+
+
+
+@app.post("/api/workspace/upload")
+
+async def upload_workspace_file(
+
+    request: Request,
+
+    file: UploadFile = File(...),
+
+) -> dict[str, Any]:
+
+    """用户上传文件/图片并自动保存到当前用户的独立工作区 uploads/ 目录。"""
+
+    user: User | None = getattr(request.state, "user", None)
+
+    if not user:
+
+        raise HTTPException(status_code=401, detail="请先登录")
+
+
+
+    if not file.filename:
+
+        raise HTTPException(status_code=400, detail="未选择文件")
+
+
+
+    workspace_dir = get_user_workspace_dir(user.id, user.username)
+
+    uploads_dir = workspace_dir / "uploads"
+
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+
+
+    raw_filename = Path(file.filename).name
+
+    safe_name = re.sub(r'[\/\\:\*\?"<>\|]', '_', raw_filename).strip()
+
+    if not safe_name:
+
+        safe_name = f"upload_{int(time.time())}.dat"
+
+
+
+    target_file = uploads_dir / safe_name
+
+    if target_file.exists():
+
+        stem = target_file.stem
+
+        suffix = target_file.suffix
+
+        safe_name = f"{stem}_{int(time.time())}{suffix}"
+
+        target_file = uploads_dir / safe_name
+
+
+
+    content = await file.read()
+
+    file_size = len(content)
+
+    if file_size > 50 * 1024 * 1024:
+
+        raise HTTPException(status_code=413, detail="文件体积超出 50MB 限制")
+
+
+
+    target_file.write_bytes(content)
+
+
+
+    rel_path = target_file.relative_to(workspace_dir).as_posix()
+
+    ext = target_file.suffix.lower()
+
+
+
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+    is_image = ext in image_extensions
+
+
+
+    b64_data = ""
+
+    extracted_text = ""
+
+    import base64
+
+
+
+    mime_type, _ = mimetypes.guess_type(target_file.name)
+
+    if not mime_type:
+
+        mime_type = "image/png" if is_image else "application/octet-stream"
+
+
+
+    if is_image:
+
+        b64_data = base64.b64encode(content).decode("ascii")
+
+    else:
+
+        extracted_text = extract_document_text(target_file)
+
+
+
+    return {
+
+        "ok": True,
+
+        "name": safe_name,
+
+        "path": rel_path,
+
+        "size": file_size,
+
+        "size_formatted": format_file_size(file_size),
+
+        "is_image": is_image,
+
+        "mime_type": mime_type,
+
+        "data": b64_data,
+
+        "extracted_text": extracted_text,
+
+    }
+
